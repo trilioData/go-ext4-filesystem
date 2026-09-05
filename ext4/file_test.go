@@ -154,6 +154,69 @@ func TestFileRead_AllSparse(t *testing.T) {
 	}
 }
 
+func TestFileInfoExposesInode(t *testing.T) {
+	inode := &Inode{Mode: FileTypeRegular | 0o644, LinksCount: 3}
+	fi := FileInfo{name: "foo", inode: inode, ino: 42}
+
+	if got := fi.Inode(); got != inode {
+		t.Fatalf("Inode() = %p, want %p", got, inode)
+	}
+	if got := fi.InodeNumber(); got != 42 {
+		t.Fatalf("InodeNumber() = %d, want 42", got)
+	}
+	sys, ok := fi.Sys().(*Inode)
+	if !ok || sys != inode {
+		t.Fatalf("Sys() = %T %v, want *Inode %p", fi.Sys(), fi.Sys(), inode)
+	}
+}
+
+func TestFileInfoSysNilWhenInodeMissing(t *testing.T) {
+	var fi FileInfo
+	if fi.Sys() != nil {
+		t.Fatalf("Sys() = %v, want nil", fi.Sys())
+	}
+}
+
+func TestReadDirInfoRootSetsInodeNumber(t *testing.T) {
+	const blockSize int64 = 4096
+	const inodeTableBlock = 1
+	const inodeSize = 256
+
+	image := make([]byte, blockSize*2)
+	// inode 2 is the second table slot (1-based).
+	offset := int(blockSize)*inodeTableBlock + 1*inodeSize
+	binary.LittleEndian.PutUint16(image[offset:offset+2], FileTypeDir|0o755)
+
+	r := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
+	gd := GroupDescriptor{}
+	gd.InodeTableLo = inodeTableBlock
+	ext4fs := &FileSystem{
+		r: r,
+		sb: Superblock{
+			LogBlockSize:  2,
+			InodeSize:     inodeSize,
+			InodePerGroup: 16,
+		},
+		gds:   []GroupDescriptor{gd},
+		cache: &mockCache[string, any]{},
+	}
+
+	info, err := ext4fs.ReadDirInfo("/")
+	if err != nil {
+		t.Fatalf("ReadDirInfo(/): %v", err)
+	}
+	fi, ok := info.(FileInfo)
+	if !ok {
+		t.Fatalf("ReadDirInfo(/) returned %T, want FileInfo", info)
+	}
+	if fi.InodeNumber() != rootInodeNumber {
+		t.Fatalf("root InodeNumber() = %d, want %d", fi.InodeNumber(), rootInodeNumber)
+	}
+	if !fi.IsDir() {
+		t.Fatal("root FileInfo.IsDir() = false, want true")
+	}
+}
+
 func TestFileInfoMode(t *testing.T) {
 	tests := []struct {
 		name     string

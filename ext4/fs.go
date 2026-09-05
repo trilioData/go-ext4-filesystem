@@ -63,6 +63,13 @@ func NewFS(r io.SectionReader, cache Cache[string, any]) (*FileSystem, error) {
 		return nil, xerrors.Errorf("failed to parse super block: %w", err)
 	}
 
+	// Refuse a filesystem using a feature this reader does not implement.
+	// Without this, such a filesystem parses "successfully" and then returns
+	// wrong bytes -- silent corruption rather than an error.
+	if err := sb.CheckSupported(); err != nil {
+		return nil, err
+	}
+
 	numBlockGroups := int64(sb.GetGroupDescriptorTableCount())
 	numBlockGroups2 := (sb.InodeCount + sb.InodePerGroup - 1) / sb.InodePerGroup
 	if numBlockGroups != int64(numBlockGroups2) {
@@ -506,6 +513,7 @@ func (ext4 *FileSystem) ReadDirInfo(name string) (fs.FileInfo, error) {
 		}
 		return FileInfo{
 			name:  "/",
+			ino:   rootInodeNumber,
 			inode: inode,
 		}, nil
 	}

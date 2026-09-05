@@ -2,11 +2,12 @@ package ext4
 
 import (
 	"bytes"
-	"golang.org/x/xerrors"
 	"io"
 	"io/fs"
 	"path/filepath"
 	"time"
+
+	"golang.org/x/xerrors"
 )
 
 var (
@@ -111,8 +112,19 @@ func (fi FileInfo) IsDir() bool {
 	return fi.inode.IsDir()
 }
 
+func (fi FileInfo) Inode() *Inode {
+	return fi.inode
+}
+
+func (fi FileInfo) InodeNumber() int64 {
+	return fi.ino
+}
+
 func (fi FileInfo) Sys() interface{} {
-	return nil
+	if fi.inode == nil {
+		return nil
+	}
+	return fi.inode
 }
 
 func (f *File) Stat() (fs.FileInfo, error) {
