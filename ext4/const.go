@@ -44,6 +44,21 @@ const (
 	FEATURE_INCOMPAT_ENCRYPT        = 0x10000
 )
 
+// Directory entry file types, stored in the entry's Flags byte when the
+// filetype feature is set. Distinct from the i_mode values below: these
+// describe the entry, not the inode, and are what lets a lookup decide
+// whether to descend without reading the inode at all.
+const (
+	DirEntryFileTypeUnknown  = 0
+	DirEntryFileTypeRegular  = 1
+	DirEntryFileTypeDir      = 2
+	DirEntryFileTypeCharDev  = 3
+	DirEntryFileTypeBlockDev = 4
+	DirEntryFileTypeFifo     = 5
+	DirEntryFileTypeSocket   = 6
+	DirEntryFileTypeSymlink  = 7
+)
+
 // File types (upper 4 bits of i_mode)
 const (
 	FileTypeMask        = 0xF000

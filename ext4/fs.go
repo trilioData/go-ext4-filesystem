@@ -27,6 +27,11 @@ type FileSystem struct {
 	gds []GroupDescriptor
 
 	cache Cache[string, any]
+
+	// Parsed directory listings, keyed by directory inode. Separate from
+	// the caller-supplied inode cache because it holds a different thing
+	// and is sized by a different budget. See direntcache.go.
+	dirents *dirEntryCache
 }
 
 func readPadding(r io.Reader) error {
@@ -85,10 +90,11 @@ func NewFS(r io.SectionReader, cache Cache[string, any]) (*FileSystem, error) {
 		cache = &mockCache[string, any]{}
 	}
 	fs := &FileSystem{
-		r:     &r,
-		sb:    sb,
-		gds:   gds,
-		cache: cache,
+		r:       &r,
+		sb:      sb,
+		gds:     gds,
+		cache:   cache,
+		dirents: newDirEntryCache(defaultDirEntryCacheEntries),
 	}
 	return fs, nil
 }
@@ -103,64 +109,109 @@ func (ext4 *FileSystem) ReadDir(path string) ([]fs.DirEntry, error) {
 	return dirEntries, nil
 }
 
-func (ext4 *FileSystem) readDirEntry(name string) ([]fs.DirEntry, error) {
-	fileInfos, err := ext4.listFileInfo(rootInodeNumber)
+// lookupChild finds one entry by name in a directory and returns its inode
+// number, without reading the inodes of any other entry.
+//
+// This is the difference between resolving a path in constant work per level
+// and in work proportional to the directory's size. The directory entry
+// already carries the child's inode number and, when the filetype feature is
+// set, its type -- so walking to the next level needs no inode read at all.
+// Building a full FileInfo for all n entries to read one integer off one of
+// them was around a quarter of all CPU during a large restore.
+func (ext4 *FileSystem) lookupChild(dirIno int64, name string) (ino int64, isDir bool, err error) {
+	entries, err := ext4.listEntries(dirIno)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to list file infos: %w", err)
+		return 0, false, xerrors.Errorf("failed to get directory entries: %w", err)
 	}
 
-	var currentIno int64
-	cleanedPath := filepath.ToSlash(filepath.Clean(name))
-	dirs := strings.Split(strings.Trim(cleanedPath, "/"), "/")
-	if len(dirs) == 1 && (dirs[0] == "." || dirs[0] == "") {
-		var dirEntries []fs.DirEntry
-		for _, fileInfo := range fileInfos {
-			if fileInfo.Name() == "." || fileInfo.Name() == ".." {
-				continue
-			}
-			dirEntries = append(dirEntries, dirEntry{fileInfo})
-		}
-		return dirEntries, nil
-	}
-
-	for i, dir := range dirs {
-		found := false
-		for _, fileInfo := range fileInfos {
-			if fileInfo.Name() != dir {
-				continue
-			}
-			if !fileInfo.IsDir() {
-				return nil, xerrors.Errorf("%s is file, directory: %w", fileInfo.Name(), fs.ErrNotExist)
-			}
-			found = true
-			currentIno = fileInfo.ino
-		}
-
-		if !found {
-			return nil, fs.ErrNotExist
-		}
-
-		fileInfos, err = ext4.listFileInfo(currentIno)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to list directory entries inode(%d): %w", currentIno, err)
-		}
-		if i != len(dirs)-1 {
+	for _, entry := range entries {
+		if entry.Name != name {
 			continue
 		}
+		ino = int64(entry.Inode)
 
-		var dirEntries []fs.DirEntry
-		for _, fileInfo := range fileInfos {
-			// Skip current directory and parent directory
-			// infinit loop in walkDir
-			if fileInfo.Name() == "." || fileInfo.Name() == ".." {
-				continue
+		switch entry.Flags {
+		case DirEntryFileTypeDir:
+			return ino, true, nil
+		case DirEntryFileTypeUnknown:
+			// The filetype feature is absent, so the entry carries no type
+			// and the inode is the only place to find it. One read, for the
+			// one entry that matched.
+			inode, err := ext4.getInode(ino)
+			if err != nil {
+				return 0, false, xerrors.Errorf("failed to get inode(%d): %w", ino, err)
 			}
-
-			dirEntries = append(dirEntries, dirEntry{fileInfo})
+			return ino, inode.IsDir(), nil
+		default:
+			return ino, false, nil
 		}
-		return dirEntries, nil
 	}
-	return nil, fs.ErrNotExist
+	return 0, false, fs.ErrNotExist
+}
+
+// resolvePath walks a path to the inode number of its final component,
+// without building a FileInfo for anything it passes.
+//
+// The empty path and "/" resolve to the root inode.
+func (ext4 *FileSystem) resolvePath(name string) (int64, error) {
+	cleaned := filepath.ToSlash(filepath.Clean(name))
+	trimmed := strings.Trim(cleaned, "/")
+	if trimmed == "" || trimmed == "." {
+		return rootInodeNumber, nil
+	}
+
+	ino := int64(rootInodeNumber)
+	parts := strings.Split(trimmed, "/")
+	for i, part := range parts {
+		child, isDir, err := ext4.lookupChild(ino, part)
+		if err != nil {
+			return 0, err
+		}
+		// Every component but the last has to be a directory to descend.
+		if i != len(parts)-1 && !isDir {
+			return 0, xerrors.Errorf("%s is file, directory: %w", part, fs.ErrNotExist)
+		}
+		ino = child
+	}
+	return ino, nil
+}
+
+func (ext4 *FileSystem) readDirEntry(name string) ([]fs.DirEntry, error) {
+	cleanedPath := filepath.ToSlash(filepath.Clean(name))
+	dirs := strings.Split(strings.Trim(cleanedPath, "/"), "/")
+
+	// Walk to the directory being listed, one cheap lookup per component.
+	// Full inodes are read only for the entries of the final directory,
+	// which is the only listing the caller sees.
+	currentIno := int64(rootInodeNumber)
+	if !(len(dirs) == 1 && (dirs[0] == "." || dirs[0] == "")) {
+		for _, dir := range dirs {
+			ino, isDir, err := ext4.lookupChild(currentIno, dir)
+			if err != nil {
+				return nil, err
+			}
+			if !isDir {
+				return nil, xerrors.Errorf("%s is file, directory: %w", dir, fs.ErrNotExist)
+			}
+			currentIno = ino
+		}
+	}
+
+	fileInfos, err := ext4.listFileInfo(currentIno)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to list directory entries inode(%d): %w", currentIno, err)
+	}
+
+	dirEntries := make([]fs.DirEntry, 0, len(fileInfos))
+	for _, fileInfo := range fileInfos {
+		// Skip current directory and parent directory,
+		// infinite loop in walkDir
+		if fileInfo.Name() == "." || fileInfo.Name() == ".." {
+			continue
+		}
+		dirEntries = append(dirEntries, dirEntry{fileInfo})
+	}
+	return dirEntries, nil
 }
 
 func (ext4 *FileSystem) listFileInfo(ino int64) ([]FileInfo, error) {
@@ -421,7 +472,23 @@ func (ext4 *FileSystem) listEntriesHTree(inode *Inode) ([]DirectoryEntry2, error
 	return entries, nil
 }
 
+// listEntries returns a directory's entries, parsed once and then cached.
+//
+// The returned slice is shared with the cache and with every other caller, so
+// it must not be modified.
 func (ext4 *FileSystem) listEntries(ino int64) ([]DirectoryEntry2, error) {
+	if entries, ok := ext4.dirents.get(ino); ok {
+		return entries, nil
+	}
+	entries, err := ext4.listEntriesUncached(ino)
+	if err != nil {
+		return nil, err
+	}
+	ext4.dirents.put(ino, entries)
+	return entries, nil
+}
+
+func (ext4 *FileSystem) listEntriesUncached(ino int64) ([]DirectoryEntry2, error) {
 	inode, err := ext4.getInode(ino)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get inode(%d): %w", ino, err)
@@ -505,8 +572,13 @@ func (ext4 *FileSystem) Stat(name string) (fs.FileInfo, error) {
 	return info, nil
 }
 
+// ReadDirInfo returns the FileInfo of one path.
+//
+// It resolves the path and reads that one inode. Listing the whole parent
+// directory and scanning it -- which is what this used to do -- meant reading
+// an inode for every sibling to answer a question about one file.
 func (ext4 *FileSystem) ReadDirInfo(name string) (fs.FileInfo, error) {
-	if name == "/" {
+	if name == "/" || name == "" {
 		inode, err := ext4.getInode(rootInodeNumber)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to parse root inode: %w", err)
@@ -517,68 +589,77 @@ func (ext4 *FileSystem) ReadDirInfo(name string) (fs.FileInfo, error) {
 			inode: inode,
 		}, nil
 	}
-	name = strings.TrimRight(name, "/")
-	dirs, dir := path.Split(name)
-	dirEntries, err := ext4.readDirEntry(dirs)
+
+	trimmed := strings.TrimRight(name, "/")
+	ino, err := ext4.resolvePath(trimmed)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to read dir entry: %w", err)
+		return nil, err
 	}
-	for _, entry := range dirEntries {
-		if entry.Name() == strings.Trim(dir, "/") {
-			return entry.Info()
-		}
+
+	inode, err := ext4.getInode(ino)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get inode(%d): %w", ino, err)
 	}
-	return nil, fs.ErrNotExist
+
+	_, base := path.Split(trimmed)
+	return FileInfo{
+		name:  base,
+		ino:   ino,
+		inode: inode,
+	}, nil
 }
 
 func (ext4 *FileSystem) Open(name string) (fs.File, error) {
 	const op = "open"
 
-	name = strings.TrimPrefix(name, "/")
-	if !fs.ValidPath(name) {
+	trimmed := strings.TrimPrefix(name, "/")
+	if !fs.ValidPath(trimmed) {
 		return nil, ext4.wrapError(op, name, fs.ErrInvalid)
 	}
 
-	dirName, fileName := filepath.Split(name)
-	entries, err := ext4.ReadDir(dirName)
+	// Resolve to a single inode rather than listing the parent directory and
+	// scanning it, which read an inode per sibling.
+	ino, err := ext4.resolvePath(trimmed)
 	if err != nil {
-		return nil, ext4.wrapError(op, name, xerrors.Errorf("failed to read directory: %w", err))
+		return nil, ext4.wrapError(op, name, err)
 	}
 
-	for _, entry := range entries {
-		if entry.IsDir() || entry.Name() != fileName {
-			continue
-		}
-		dir, ok := entry.(dirEntry)
-		if !ok {
-			return nil, xerrors.Errorf("unspecified error, entry is not dir entry %+v", entry)
-		}
-		// Resolve symlinks
-		if dir.inode.IsSymlink() {
-			link, err := ext4.ReadLink(dir.name)
-			if err != nil {
-				return nil, xerrors.Errorf("failed to read link: %w", err)
-			}
-			return ext4.Open(link)
-		}
+	inode, err := ext4.getInode(ino)
+	if err != nil {
+		return nil, ext4.wrapError(op, name, xerrors.Errorf("failed to get inode(%d): %w", ino, err))
+	}
 
-		fi := FileInfo{
-			name:  fileName,
-			ino:   dir.ino,
-			inode: dir.inode,
-		}
-		var f *File
-		if fi.inode.UsesExtents() {
-			f, err = ext4.file(fi, name)
-		} else {
-			f, err = ext4.fileFromBlock(fi, name)
-		}
+	// A directory is not openable as a file, matching the previous behaviour
+	// where directory entries were skipped by the scan.
+	if inode.IsDir() {
+		return nil, ext4.wrapError(op, name, fs.ErrNotExist)
+	}
+
+	if inode.IsSymlink() {
+		link, err := ext4.ReadLink(trimmed)
 		if err != nil {
-			return nil, xerrors.Errorf("failed to get file(inode: %d): %w", dir.ino, err)
+			return nil, xerrors.Errorf("failed to read link: %w", err)
 		}
-		return f, nil
+		return ext4.Open(link)
 	}
-	return nil, fs.ErrNotExist
+
+	_, fileName := filepath.Split(trimmed)
+	fi := FileInfo{
+		name:  fileName,
+		ino:   ino,
+		inode: inode,
+	}
+
+	var f *File
+	if inode.UsesExtents() {
+		f, err = ext4.file(fi, trimmed)
+	} else {
+		f, err = ext4.fileFromBlock(fi, trimmed)
+	}
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get file(inode: %d): %w", ino, err)
+	}
+	return f, nil
 }
 
 func (ext4 *FileSystem) ReadLink(name string) (string, error) {
