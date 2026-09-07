@@ -1,4 +1,4 @@
-module github.com/masahiro331/go-ext4-filesystem
+module github.com/dipayan-trilio/go-ext4-filesystem
 
 go 1.18
 

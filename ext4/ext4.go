@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/xerrors"
 
-	"github.com/masahiro331/go-ext4-filesystem/log"
+	"github.com/dipayan-trilio/go-ext4-filesystem/log"
 )
 
 /*
