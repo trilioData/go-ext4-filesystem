@@ -168,6 +168,14 @@ func (ext4 *FileSystem) extents(b []byte, extents []Extent, expectedDepth int) (
 			if err != nil {
 				return nil, xerrors.Errorf("failed to read leaf node extent: %w", err)
 			}
+			// A leaf extent addresses file content. Nothing downstream can
+			// tell a bad address from a good one -- file data has no magic
+			// number to fail against -- so it is rejected here or its bytes
+			// are served as file content.
+			if err := ext4.checkPhysicalBlocks(extent.offset(),
+				int64(extent.GetLen()), "leaf extent"); err != nil {
+				return nil, err
+			}
 			extents = append(extents, extent)
 		}
 	} else {
@@ -179,6 +187,14 @@ func (ext4 *FileSystem) extents(b []byte, extents []Extent, expectedDepth int) (
 			}
 			b := make([]byte, ext4.sb.GetBlockSize())
 			physBlock := int64(extent.LeafHigh)<<32 | int64(extent.LeafLow)
+			// An internal node is caught one level down by the extent header
+			// magic, but only after a block has been read from an arbitrary
+			// offset. Checking first keeps a bad address from reaching the
+			// device at all.
+			if err := ext4.checkPhysicalBlocks(physBlock, 1,
+				"internal extent node"); err != nil {
+				return nil, err
+			}
 			_, err = ext4.r.ReadAt(b, physBlock*ext4.sb.GetBlockSize())
 			if err != nil {
 				return nil, xerrors.Errorf("failed to read leaf node extent: %w", err)
@@ -191,6 +207,31 @@ func (ext4 *FileSystem) extents(b []byte, extents []Extent, expectedDepth int) (
 		}
 	}
 	return extents, nil
+}
+
+// checkPhysicalBlocks rejects a physical block range that does not lie inside
+// the filesystem.
+//
+// A block address read out of an extent is data, and a corrupt or crafted one
+// addresses whatever happens to sit at that offset on the device. The reader
+// is handed a region that is usually larger than the filesystem -- a
+// partition has slack past the last block, and a whole disk has more past the
+// partition -- so an out-of-range address often lands on readable bytes and
+// the read succeeds. Those bytes then leave as file content.
+//
+// The bound is the superblock's own: a legitimate address is at least
+// FirstDataBlock and the range must end at or before the last block. Same
+// check the xattr block already makes.
+func (ext4 *FileSystem) checkPhysicalBlocks(start, count int64, what string) error {
+	first := int64(ext4.sb.FirstDataBlock)
+	total := ext4.sb.GetBlockCount()
+
+	if start < first || start >= total || start+count > total {
+		return xerrors.Errorf(
+			"%s: physical block %d + %d blocks is outside the filesystem (blocks %d..%d)",
+			what, start, count, first, total-1)
+	}
+	return nil
 }
 
 func (e *Extent) offset() int64 {

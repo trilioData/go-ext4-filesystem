@@ -20,12 +20,13 @@ Every section has a plain description first and a fuller one after it.
 | `ext4/features.go` | **new** | refuse filesystems using unsupported features (§2) |
 | `ext4/xattr.go` | **new** | read extended attributes (§3) |
 | `ext4/fs.go` | modified | call the feature gate (§2); cache directory listings (§5); cheap path resolution (§6) |
-| `ext4/ext4.go` | modified | cache inodes by reference rather than by copy (§4) |
+| `ext4/ext4.go` | modified | cache inodes by reference rather than by copy (§4); validate extent block addresses (§7) |
 | `ext4/direntcache.go` | **new** | the directory-listing cache (§5) |
 | `ext4/const.go` | modified | directory-entry file-type constants (§6) |
 | `ext4/file_test.go` | modified | tests for the accessors in §1 |
+| `ext4/ext4_test.go` | modified | tests for the address check in §7; block count added to fixtures |
 
-Roughly 780 lines added across the fork.
+Roughly 950 lines added across the fork.
 
 ---
 
@@ -249,7 +250,72 @@ directory size into roughly constant work.
 
 ---
 
-## 7. Results
+## 7. A corrupt block address was read rather than refused
+
+### In plain terms
+
+**Issue.** A file's contents are found through a list of addresses stored on
+disk saying "this file's data lives at block 4,000". The reader trusted those
+addresses without checking them. An address pointing outside the filesystem
+would still be read, because the region handed to the reader is normally
+bigger than the filesystem itself -- a partition has unused space after its
+last filesystem block, and a whole disk has more after the partition. So the
+read succeeded, returned whatever bytes happened to be sitting there, and they
+were written into the restored file as its contents. No error, no warning, a
+restore that reported success.
+
+**Change.** Before an address is used, it is checked against the filesystem's
+own record of how many blocks it has. Anything outside that range is refused
+with an error naming the address.
+
+**Result.** A damaged or tampered-with image now fails and says which address
+was wrong, instead of quietly producing a file full of unrelated bytes.
+
+### In more detail
+
+The addresses live in the extent tree, which has two kinds of entry, and they
+were exposed differently:
+
+- **Internal nodes** point at another block of the tree. A bad address here was
+  usually caught one level down, because the next thing read is an extent
+  header and the reader checks its magic number. That was luck rather than
+  design, and the check only ran after a block had already been read from an
+  arbitrary offset.
+- **Leaf entries** point at file content, and there is no magic number in file
+  data to fail against. Nothing downstream could tell a good address from a bad
+  one. This was the silent path.
+
+Both now validate against `[FirstDataBlock, block count)` from the superblock,
+and the extent's length has to fit inside that range too -- otherwise a
+plausible start address with an absurd length walks off the end. The check
+sits in the one function that parses extents, so the four places that turn an
+address into a read are all covered by it rather than each needing its own
+check. It is the same bound the external attribute block was already checking.
+
+Worth being clear about the boundary this does *not* move: the reader is given
+a region, and where that region ends is a separate question from where the
+filesystem ends. Bounding the region more tightly would not have helped,
+because the gap between the two is exactly where a bad address lands and still
+finds readable bytes. The check has to be on the address, against the
+superblock.
+
+This is not a bug that was hit. It needs a damaged or deliberately crafted
+image, and the images this reader is pointed at come from a writer under the
+same control. It is here because the failure mode is the one the feature gate
+in section 2 exists to prevent -- a successful restore of the wrong bytes --
+and closing it costs one comparison per extent.
+
+The test fixtures needed a correction alongside it. Several hand-built
+superblocks in the unit tests left the block count at zero, which declares a
+filesystem with no blocks at all and makes every address in the fixture out of
+range. They were relying on the absence of the check. One test that
+deliberately addresses block 2^32+2, to prove 64-bit addresses are assembled
+correctly, now also declares the 64bit feature and a block count past that
+block -- which is what a real filesystem addressing it would have.
+
+---
+
+## 8. Results
 
 | | before | after | |
 | --- | --- | --- | --- |
@@ -287,7 +353,7 @@ before deciding it is worth the churn.
 
 ---
 
-## 8. Correctness
+## 9. Correctness
 
 None of the performance changes alter what the reader returns, only how much
 work it does to return it. The capability changes add what was missing without
@@ -301,6 +367,12 @@ boundary, directories large enough to be indexed, 255-byte and non-ASCII
 names, extended attributes in both storage locations, a read-only file
 carrying an attribute, and ten cases of an unsupported feature being correctly
 refused.
+
+The address check in section 7 is covered separately, by unit tests rather
+than fixtures -- a valid image cannot contain a bad address, so the cases have
+to be built by hand. Four of them: an address past the end, one exactly at the
+end, one starting inside the filesystem but running past the end, and the
+boundary that must be *accepted*, an extent ending exactly on the last block.
 
 File contents are checked against checksums taken from the source tree before
 it was written into the image, and metadata against `debugfs`, the reference

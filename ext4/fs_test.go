@@ -288,7 +288,7 @@ func TestListEntriesHTreeDirect(t *testing.T) {
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(totalSize))
 	ext4fs := &FileSystem{
 		r:     sr,
-		sb:    Superblock{LogBlockSize: 2}, // blockSize = 4096
+		sb:    Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, // blockSize = 4096
 		cache: &mockCache[string, any]{},
 	}
 
@@ -370,7 +370,7 @@ func TestListEntriesHTreeWithInternalNodes(t *testing.T) {
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(totalSize))
 	ext4fs := &FileSystem{
 		r:     sr,
-		sb:    Superblock{LogBlockSize: 2},
+		sb:    Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
 		cache: &mockCache[string, any]{},
 	}
 
@@ -428,7 +428,7 @@ func TestListEntriesHTreeBlockAddressing(t *testing.T) {
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(totalSize))
 	ext4fs := &FileSystem{
 		r:     sr,
-		sb:    Superblock{LogBlockSize: 2},
+		sb:    Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
 		cache: &mockCache[string, any]{},
 	}
 
@@ -451,7 +451,7 @@ func TestListEntriesHTreeRootBlockReadFailure(t *testing.T) {
 	sr := io.NewSectionReader(bytes.NewReader(smallImage), 0, 16)
 	ext4fs := &FileSystem{
 		r:     sr,
-		sb:    Superblock{LogBlockSize: 2}, // 4096 byte blocks
+		sb:    Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, // 4096 byte blocks
 		cache: &mockCache[string, any]{},
 	}
 
@@ -491,7 +491,7 @@ func TestCollectLeafBlocksInternalNodeCountZero(t *testing.T) {
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(totalSize))
 	ext4fs := &FileSystem{
 		r:     sr,
-		sb:    Superblock{LogBlockSize: 2},
+		sb:    Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
 		cache: &mockCache[string, any]{},
 	}
 
@@ -525,7 +525,7 @@ func TestReadLogicalBlockMissingBlock(t *testing.T) {
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(blockSize))
 	ext4fs := &FileSystem{
 		r:     sr,
-		sb:    Superblock{LogBlockSize: 2},
+		sb:    Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
 		cache: &mockCache[string, any]{},
 	}
 
@@ -626,7 +626,7 @@ func TestListEntriesHTreeCountExceedsLimit(t *testing.T) {
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(totalSize))
 	ext4fs := &FileSystem{
 		r:     sr,
-		sb:    Superblock{LogBlockSize: 2},
+		sb:    Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
 		cache: &mockCache[string, any]{},
 	}
 
@@ -661,7 +661,7 @@ func TestListEntriesHTreeInternalNodeCountExceedsLimit(t *testing.T) {
 	copy(rootInode.BlockOrExtents[:], extBuf.Bytes())
 
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(totalSize))
-	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2}, cache: &mockCache[string, any]{}}
+	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, cache: &mockCache[string, any]{}}
 
 	_, err := ext4fs.listEntriesHTree(rootInode)
 	if err == nil {
@@ -685,7 +685,7 @@ func TestListEntriesHTreeIndirectLevelsTooHigh(t *testing.T) {
 		copy(rootInode.BlockOrExtents[:], extBuf.Bytes())
 
 		sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(totalSize))
-		ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2}, cache: &mockCache[string, any]{}}
+		ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, cache: &mockCache[string, any]{}}
 
 		_, err := ext4fs.listEntriesHTree(rootInode)
 		if err == nil {
@@ -706,7 +706,7 @@ func TestListEntriesHTreeIndirectLevelsTooHigh(t *testing.T) {
 		copy(rootInode.BlockOrExtents[:], extBuf.Bytes())
 
 		sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(totalSize))
-		sb := Superblock{LogBlockSize: 2, FeatureIncompat: FEATURE_INCOMPAT_LARGEDIR}
+		sb := Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount, FeatureIncompat: FEATURE_INCOMPAT_LARGEDIR}
 		ext4fs := &FileSystem{r: sr, sb: sb, cache: &mockCache[string, any]{}}
 
 		_, err := ext4fs.listEntriesHTree(rootInode)
@@ -800,7 +800,7 @@ func TestListEntriesDispatchesToHTree(t *testing.T) {
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(totalSize))
 	ext4fs := &FileSystem{
 		r:  sr,
-		sb: Superblock{LogBlockSize: 2, InodePerGroup: 64, InodeSize: 256},
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount, InodePerGroup: 64, InodeSize: 256},
 		gds: []GroupDescriptor{
 			{GroupDescriptor32: GroupDescriptor32{InodeTableLo: 2}},
 		},
@@ -852,7 +852,7 @@ func TestGetBlockAddressesSparseDirectBlocks(t *testing.T) {
 
 	image := make([]byte, 8*blockSize)
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
-	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2}, cache: &mockCache[string, any]{}}
+	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, cache: &mockCache[string, any]{}}
 
 	addrs, err := inode.GetBlockAddresses(ext4fs)
 	if err != nil {
@@ -892,7 +892,7 @@ func TestGetBlockAddressesSparseIndirectBlock(t *testing.T) {
 	inode := buildBlockAddressingInode(directBlocks, 16, 0, 0, totalBlocks*blockSize)
 
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
-	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2}, cache: &mockCache[string, any]{}}
+	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, cache: &mockCache[string, any]{}}
 
 	addrs, err := inode.GetBlockAddresses(ext4fs)
 	if err != nil {
@@ -932,7 +932,7 @@ func TestGetBlockAddressesNullIndirectPointers(t *testing.T) {
 
 	image := make([]byte, blockSize)
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
-	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2}, cache: &mockCache[string, any]{}}
+	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, cache: &mockCache[string, any]{}}
 
 	addrs, err := inode.GetBlockAddresses(ext4fs)
 	if err != nil {
@@ -971,7 +971,7 @@ func TestBuildDirectoryBlockMapSkipsZero(t *testing.T) {
 
 	image := make([]byte, 8*blockSize)
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
-	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2}, cache: &mockCache[string, any]{}}
+	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, cache: &mockCache[string, any]{}}
 
 	m, err := ext4fs.buildDirectoryBlockMap(inode)
 	if err != nil {
@@ -1017,7 +1017,7 @@ func TestBuildDirectoryBlockMapExtents(t *testing.T) {
 
 	image := make([]byte, 25*blockSize)
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
-	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2}, cache: &mockCache[string, any]{}}
+	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, cache: &mockCache[string, any]{}}
 
 	m, err := ext4fs.buildDirectoryBlockMap(inode)
 	if err != nil {
@@ -1066,7 +1066,7 @@ func TestBuildDirectoryBlockMapRejectsUninitializedExtent(t *testing.T) {
 
 	image := make([]byte, 25*blockSize)
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
-	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2}, cache: &mockCache[string, any]{}}
+	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, cache: &mockCache[string, any]{}}
 
 	_, err := ext4fs.buildDirectoryBlockMap(inode)
 	if err == nil {
@@ -1097,7 +1097,7 @@ func TestFileFromBlockSkipsZeroAddresses(t *testing.T) {
 	}
 
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
-	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2}, cache: &mockCache[string, any]{}}
+	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, cache: &mockCache[string, any]{}}
 
 	fi := FileInfo{
 		name:  "sparse.bin",
@@ -1178,7 +1178,7 @@ func TestFileReadPartialLastBlock(t *testing.T) {
 	inode := buildBlockAddressingInode(directBlocks, 0, 0, 0, fileSize)
 
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
-	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2}, cache: &mockCache[string, any]{}}
+	ext4fs := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, cache: &mockCache[string, any]{}}
 
 	fi := FileInfo{
 		name:  "partial.bin",
@@ -1278,7 +1278,7 @@ func TestListEntriesExtentReadAt(t *testing.T) {
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(totalSize))
 	ext4fs := &FileSystem{
 		r:  sr,
-		sb: Superblock{LogBlockSize: 2, InodePerGroup: 64, InodeSize: 256},
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount, InodePerGroup: 64, InodeSize: 256},
 		gds: []GroupDescriptor{
 			{GroupDescriptor32: GroupDescriptor32{InodeTableLo: 2}},
 		},
@@ -1333,7 +1333,7 @@ func TestListEntriesExtentRejectsUninitializedExtent(t *testing.T) {
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(totalSize))
 	ext4fs := &FileSystem{
 		r:  sr,
-		sb: Superblock{LogBlockSize: 2, InodePerGroup: 64, InodeSize: 256},
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount, InodePerGroup: 64, InodeSize: 256},
 		gds: []GroupDescriptor{
 			{GroupDescriptor32: GroupDescriptor32{InodeTableLo: 2}},
 		},
@@ -1395,7 +1395,7 @@ func TestListEntriesBlockAddressingReadAt(t *testing.T) {
 	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(totalSize))
 	ext4fs := &FileSystem{
 		r:  sr,
-		sb: Superblock{LogBlockSize: 2, InodePerGroup: 64, InodeSize: 256},
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount, InodePerGroup: 64, InodeSize: 256},
 		gds: []GroupDescriptor{
 			{GroupDescriptor32: GroupDescriptor32{InodeTableLo: 2}},
 		},

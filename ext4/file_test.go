@@ -193,7 +193,7 @@ func TestReadDirInfoRootSetsInodeNumber(t *testing.T) {
 	ext4fs := &FileSystem{
 		r: r,
 		sb: Superblock{
-			LogBlockSize:  2,
+			LogBlockSize: 2, BlockCountLo: testBlockCount,
 			InodeSize:     inodeSize,
 			InodePerGroup: 16,
 		},
@@ -336,7 +336,7 @@ func TestFileRead_UninitializedExtentReadsZeros(t *testing.T) {
 
 	fs := &FileSystem{
 		r:  r,
-		sb: Superblock{LogBlockSize: 2}, // 4096
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}, // 4096
 	}
 
 	fi := FileInfo{name: "test", inode: inode}

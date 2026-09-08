@@ -177,24 +177,12 @@ func (ext4 *FileSystem) resolvePath(name string) (int64, error) {
 }
 
 func (ext4 *FileSystem) readDirEntry(name string) ([]fs.DirEntry, error) {
-	cleanedPath := filepath.ToSlash(filepath.Clean(name))
-	dirs := strings.Split(strings.Trim(cleanedPath, "/"), "/")
-
 	// Walk to the directory being listed, one cheap lookup per component.
 	// Full inodes are read only for the entries of the final directory,
 	// which is the only listing the caller sees.
-	currentIno := int64(rootInodeNumber)
-	if !(len(dirs) == 1 && (dirs[0] == "." || dirs[0] == "")) {
-		for _, dir := range dirs {
-			ino, isDir, err := ext4.lookupChild(currentIno, dir)
-			if err != nil {
-				return nil, err
-			}
-			if !isDir {
-				return nil, xerrors.Errorf("%s is file, directory: %w", dir, fs.ErrNotExist)
-			}
-			currentIno = ino
-		}
+	currentIno, err := ext4.resolveDirPath(name)
+	if err != nil {
+		return nil, err
 	}
 
 	fileInfos, err := ext4.listFileInfo(currentIno)
@@ -212,6 +200,63 @@ func (ext4 *FileSystem) readDirEntry(name string) ([]fs.DirEntry, error) {
 		dirEntries = append(dirEntries, dirEntry{fileInfo})
 	}
 	return dirEntries, nil
+}
+
+// ReadDirNames returns the names of the entries in a directory, without
+// reading any of their inodes.
+//
+// ReadDir has to build an fs.FileInfo per entry, and that costs one inode
+// read each. A caller that only wants names -- a tree walk that stats each
+// child as it reaches it, rather than all of them up front -- pays n inode
+// reads for data it discards. On a directory of 13,762 files backed by a
+// high-latency device that was tens of seconds before the first name came
+// back.
+//
+// "." and ".." are omitted, matching ReadDir.
+func (ext4 *FileSystem) ReadDirNames(path string) ([]string, error) {
+	ino, err := ext4.resolveDirPath(path)
+	if err != nil {
+		return nil, ext4.wrapError("read directory names", path, err)
+	}
+
+	entries, err := ext4.listEntries(ino)
+	if err != nil {
+		return nil, ext4.wrapError("read directory names", path,
+			xerrors.Errorf("failed to get directory entries: %w", err))
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Name == "." || entry.Name == ".." {
+			continue
+		}
+		names = append(names, entry.Name)
+	}
+	return names, nil
+}
+
+// resolveDirPath walks to the directory named by path and returns its inode
+// number. Shared by ReadDir and ReadDirNames so the two cannot disagree about
+// what a path means.
+func (ext4 *FileSystem) resolveDirPath(name string) (int64, error) {
+	cleanedPath := filepath.ToSlash(filepath.Clean(name))
+	dirs := strings.Split(strings.Trim(cleanedPath, "/"), "/")
+
+	currentIno := int64(rootInodeNumber)
+	if len(dirs) == 1 && (dirs[0] == "." || dirs[0] == "") {
+		return currentIno, nil
+	}
+	for _, dir := range dirs {
+		ino, isDir, err := ext4.lookupChild(currentIno, dir)
+		if err != nil {
+			return 0, err
+		}
+		if !isDir {
+			return 0, xerrors.Errorf("%s is file, directory: %w", dir, fs.ErrNotExist)
+		}
+		currentIno = ino
+	}
+	return currentIno, nil
 }
 
 func (ext4 *FileSystem) listFileInfo(ino int64) ([]FileInfo, error) {

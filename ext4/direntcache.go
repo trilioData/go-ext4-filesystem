@@ -28,8 +28,8 @@ type dirEntryCache struct {
 	maxEntries int
 	curEntries int
 
-	order *list.List               // front is most recently used
-	items map[int64]*list.Element  // directory inode -> element
+	order *list.List              // front is most recently used
+	items map[int64]*list.Element // directory inode -> element
 }
 
 type dirEntryCacheItem struct {

@@ -7,6 +7,13 @@ import (
 	"testing"
 )
 
+// testBlockCount is the block count given to the hand-built superblocks in
+// these tests. Extent addresses are validated against the superblock's block
+// count, so a fixture that leaves it zero declares a filesystem with no
+// blocks, and every address in it is out of range. The value only has to be
+// larger than any block the fixtures reference.
+const testBlockCount = 1 << 20
+
 // TestExtents_InternalNodeUsesFullBlockSize verifies that extents() reads
 // the full block size (not SectorSize) when following internal extent nodes.
 // With a 4096-byte block, a leaf node can hold up to 340 extents, but if
@@ -46,7 +53,7 @@ func TestExtents_InternalNodeUsesFullBlockSize(t *testing.T) {
 	fs := &FileSystem{
 		r: r,
 		sb: Superblock{
-			LogBlockSize: 2, // 1024 << 2 = 4096
+			LogBlockSize: 2, BlockCountLo: testBlockCount, // 1024 << 2 = 4096
 		},
 	}
 
@@ -84,7 +91,7 @@ func TestExtents_EntriesExceedsMax(t *testing.T) {
 	})
 
 	fs := &FileSystem{
-		sb: Superblock{LogBlockSize: 2},
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
 	}
 	_, err := fs.extents(rootBuf.Bytes(), nil, extentDepthRoot)
 	if err == nil {
@@ -114,7 +121,7 @@ func TestExtents_DepthMismatch(t *testing.T) {
 	r := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
 	fs := &FileSystem{
 		r:  r,
-		sb: Superblock{LogBlockSize: 2},
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
 	}
 
 	rootBuf := &bytes.Buffer{}
@@ -147,7 +154,7 @@ func TestExtents_InvalidMagic(t *testing.T) {
 	})
 
 	fs := &FileSystem{
-		sb: Superblock{LogBlockSize: 2},
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
 	}
 	_, err := fs.extents(rootBuf.Bytes(), nil, extentDepthRoot)
 	if err == nil {
@@ -167,7 +174,7 @@ func TestExtents_DepthExceedsMax(t *testing.T) {
 	})
 
 	fs := &FileSystem{
-		sb: Superblock{LogBlockSize: 2},
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
 	}
 	_, err := fs.extents(rootBuf.Bytes(), nil, extentDepthRoot)
 	if err == nil {
@@ -213,8 +220,14 @@ func TestExtents_InternalNodeLeafHighAddress(t *testing.T) {
 	r := io.NewSectionReader(sr, 0, expectedOffset+int64(blockSize))
 	fs := &FileSystem{
 		r: r,
+		// A filesystem that addresses block 2^32+2 must have the 64bit
+		// feature and a block count past that block, or the address is
+		// genuinely out of range.
 		sb: Superblock{
-			LogBlockSize: 2, // 4096
+			LogBlockSize:    2, // 4096
+			FeatureIncompat: FEATURE_INCOMPAT_64BIT,
+			BlockCountHi:    2,
+			BlockCountLo:    16,
 		},
 	}
 
@@ -309,7 +322,7 @@ func TestGetInode_SmallInodeSize(t *testing.T) {
 			fs := &FileSystem{
 				r: r,
 				sb: Superblock{
-					LogBlockSize:  2, // 4096
+					LogBlockSize: 2, BlockCountLo: testBlockCount, // 4096
 					InodeSize:     tt.inodeSize,
 					InodePerGroup: uint32(tt.numInodes),
 				},
@@ -359,7 +372,7 @@ func TestGetInode_SmallInodeSizeExtendedFieldsZero(t *testing.T) {
 	fs := &FileSystem{
 		r: r,
 		sb: Superblock{
-			LogBlockSize:  2,
+			LogBlockSize: 2, BlockCountLo: testBlockCount,
 			InodeSize:     inodeSize,
 			InodePerGroup: 16,
 		},
@@ -383,5 +396,109 @@ func TestGetInode_SmallInodeSizeExtendedFieldsZero(t *testing.T) {
 	}
 	if inode.CtimeExtra != 0 {
 		t.Errorf("CtimeExtra = %#x, want 0", inode.CtimeExtra)
+	}
+}
+
+// TestExtentsRejectsOutOfRangeLeaf checks that a leaf extent addressing
+// blocks past the end of the filesystem is refused.
+//
+// This is the silent case: a leaf extent addresses file content, and file
+// content has no magic number to fail against. Without the check the read
+// succeeds -- a partition has slack past its last filesystem block, and a
+// disk has more past the partition -- and those bytes leave as file data.
+func TestExtentsRejectsOutOfRangeLeaf(t *testing.T) {
+	const blockCount = 100
+
+	for _, tt := range []struct {
+		name  string
+		start uint32
+		len   uint16
+	}{
+		{"start past the end", blockCount + 5, 1},
+		{"start at the end", blockCount, 1},
+		{"starts inside but runs past the end", blockCount - 2, 8},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := &bytes.Buffer{}
+			binary.Write(buf, binary.LittleEndian, ExtentHeader{
+				Magic:   0xF30A,
+				Entries: 1,
+				Max:     4,
+				Depth:   0,
+			})
+			binary.Write(buf, binary.LittleEndian, Extent{
+				Block:   0,
+				Len:     tt.len,
+				StartHi: 0,
+				StartLo: tt.start,
+			})
+
+			fs := &FileSystem{
+				sb: Superblock{LogBlockSize: 2, BlockCountLo: blockCount},
+			}
+			if _, err := fs.extents(buf.Bytes(), nil, extentDepthRoot); err == nil {
+				t.Fatal("expected an out-of-range error, got nil")
+			}
+		})
+	}
+}
+
+// TestExtentsAcceptsLastBlock is the boundary on the other side: an extent
+// ending exactly on the last block is legitimate and must not be refused.
+func TestExtentsAcceptsLastBlock(t *testing.T) {
+	const blockCount = 100
+
+	buf := &bytes.Buffer{}
+	binary.Write(buf, binary.LittleEndian, ExtentHeader{
+		Magic:   0xF30A,
+		Entries: 1,
+		Max:     4,
+		Depth:   0,
+	})
+	binary.Write(buf, binary.LittleEndian, Extent{
+		Block:   0,
+		Len:     4,
+		StartHi: 0,
+		StartLo: blockCount - 4, // ends on the last block
+	})
+
+	fs := &FileSystem{
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: blockCount},
+	}
+	extents, err := fs.extents(buf.Bytes(), nil, extentDepthRoot)
+	if err != nil {
+		t.Fatalf("extent ending on the last block was refused: %v", err)
+	}
+	if len(extents) != 1 {
+		t.Fatalf("got %d extents, want 1", len(extents))
+	}
+}
+
+// TestExtentsRejectsOutOfRangeInternalNode checks the internal-node path.
+// A bad address here is usually caught one level down by the extent header
+// magic, but only after a block has been read from an arbitrary offset.
+func TestExtentsRejectsOutOfRangeInternalNode(t *testing.T) {
+	const blockCount = 100
+
+	buf := &bytes.Buffer{}
+	binary.Write(buf, binary.LittleEndian, ExtentHeader{
+		Magic:   0xF30A,
+		Entries: 1,
+		Max:     4,
+		Depth:   1,
+	})
+	binary.Write(buf, binary.LittleEndian, ExtentInternal{
+		Block:    0,
+		LeafLow:  blockCount + 50,
+		LeafHigh: 0,
+	})
+
+	// A nil reader: reaching a read at all is itself the failure, so this
+	// panics rather than returning a misleading error if the check is gone.
+	fs := &FileSystem{
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: blockCount},
+	}
+	if _, err := fs.extents(buf.Bytes(), nil, extentDepthRoot); err == nil {
+		t.Fatal("expected an out-of-range error, got nil")
 	}
 }
