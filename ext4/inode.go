@@ -24,16 +24,31 @@ type Extent struct {
 	StartLo uint32 `struc:"uint32,little"`
 }
 
+// EXT_INIT_MAX_LEN. An extent's length field is one 16-bit number carrying
+// both the block count and the unwritten flag, and it does so by splitting its
+// range rather than reserving a bit: a value up to and including this is a
+// written extent of exactly that length, and anything above it is an unwritten
+// extent whose real length is the value minus this.
+//
+// The boundary is therefore a comparison, not a test of bit 15. The two agree
+// everywhere except at one value -- 32768 has bit 15 set but is a *written*
+// extent of the maximum length ext4 can describe, 128 MiB at a 4 KiB block
+// size. See ext4_ext_is_unwritten and ext4_ext_get_actual_len in
+// fs/ext4/ext4_extents.h, both of which compare against EXT_INIT_MAX_LEN.
+const extentInitMaxLen = 32768
+
 // IsUninitialized returns true if this extent is unwritten (allocated but
 // not yet written). Reads from such extents should return zeros.
 func (e *Extent) IsUninitialized() bool {
-	return e.Len&0x8000 != 0
+	return e.Len > extentInitMaxLen
 }
 
-// GetLen returns the actual number of blocks, masking off the
-// uninitialized flag in bit 15.
+// GetLen returns the number of blocks the extent covers.
 func (e *Extent) GetLen() uint16 {
-	return e.Len & 0x7FFF
+	if e.Len <= extentInitMaxLen {
+		return e.Len
+	}
+	return e.Len - extentInitMaxLen
 }
 
 // DirectoryEntry2 is more or less a flat file that maps an arbitrary byte string

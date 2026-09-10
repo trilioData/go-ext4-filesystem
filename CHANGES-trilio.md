@@ -21,12 +21,14 @@ Every section has a plain description first and a fuller one after it.
 | `ext4/xattr.go` | **new** | read extended attributes (§3) |
 | `ext4/fs.go` | modified | call the feature gate (§2); cache directory listings (§5); cheap path resolution (§6) |
 | `ext4/ext4.go` | modified | cache inodes by reference rather than by copy (§4); validate extent block addresses (§7) |
+| `ext4/inode.go` | modified | correct the written/unwritten extent length boundary (§8) |
 | `ext4/direntcache.go` | **new** | the directory-listing cache (§5) |
 | `ext4/const.go` | modified | directory-entry file-type constants (§6) |
 | `ext4/file_test.go` | modified | tests for the accessors in §1 |
 | `ext4/ext4_test.go` | modified | tests for the address check in §7; block count added to fixtures |
+| `ext4/inode_test.go` | modified | extent length boundary tests (§8); corrects a case that asserted the old behaviour |
 
-Roughly 950 lines added across the fork.
+Roughly 1,060 lines added across the fork.
 
 ---
 
@@ -315,7 +317,91 @@ block -- which is what a real filesystem addressing it would have.
 
 ---
 
-## 8. Results
+## 8. A maximum-length extent read back as 128 MiB of zeros
+
+### In plain terms
+
+**Issue.** A file's data is described by a list of extents -- entries saying
+"this stretch of the file lives at this stretch of the disk". Each entry stores
+its length in a single 16-bit number, and that number does two jobs at once: it
+carries the block count, and it says whether the extent holds real data or is
+reserved space that should read as zeros. ext4 does this by splitting the
+number's range, not by reserving a bit -- a value up to and including 32768
+means real data of exactly that length, and anything above it means reserved
+space whose real length is the value minus 32768.
+
+The reader tested bit 15 instead of comparing. Those two rules agree on every
+value but one: 32768 has bit 15 set, yet it is real data of the maximum length
+ext4 can describe -- 128 MiB at a 4 KiB block size. So a full-length extent was
+read as "reserved, zero blocks long", dropped from the file's block map, and
+every byte it covered was served as zeros.
+
+**Change.** `IsUninitialized` compares against 32768 rather than masking bit 15,
+and `GetLen` returns the value unchanged below the boundary and subtracts 32768
+above it. This is what `ext4_ext_is_unwritten` and `ext4_ext_get_actual_len` in
+`fs/ext4/ext4_extents.h` do.
+
+**Result.** Files containing a maximum-length extent restore with their real
+contents instead of a 128 MiB run of zeros. Nothing about the failure was
+visible before: no error, no warning, correct file size, correct permissions,
+correct timestamps, and `fsck` clean on the image -- only the bytes were wrong.
+
+### In more detail
+
+The value is not an unlikely one. Any allocator that fills an extent to
+capacity produces it, and the skeleton builder does so deliberately:
+
+```python
+want = min(remaining, EXT4_MAX_EXTENT_BLOCKS)   # 32768
+```
+
+So **every file larger than 128 MiB** carries at least one such extent. Density
+and sparseness are irrelevant: what matters is whether any single contiguous run
+reaches 32768 blocks. A 200 MiB contiguous file has one, a 200 MiB file
+fragmented into 4 MiB pieces has none.
+
+Measured on a 3,077,318,007-byte file. Its extent list, from `debugfs`:
+
+```
+(0     - 15320 ) : 17447-32767      15,321 blocks   served correctly
+(15321 - 48088 ) : 33793-66560      32,768 blocks   dropped -> zeros
+(48089 - 79831 ) : 66561-98303      31,743 blocks   served correctly
+(79832 - 112599) : 99329-132096     32,768 blocks   dropped -> zeros
+```
+
+`cmp` between the source file and its restored copy reported the first
+difference at byte 62,754,817 -- which is block 15,321, exactly where the first
+maximum-length extent begins.
+
+Across a 64,697-entry tree, 7 files restored with wrong contents and the split
+was exact: every file needing more than one extent failed, every file fitting in
+one extent passed. The largest that passed was 101 MiB; the smallest that failed
+was 164 MiB.
+
+Three other call sites read the same length field, and all three were wrong in
+the same way:
+
+- `fs.go:786` builds a file's logical-to-physical block map and skips extents it
+  believes are unwritten. This is the one that produced the zeros.
+- `fs.go:342` and `fs.go:583` walk a directory's blocks and *reject* an
+  unwritten extent with an error. A directory large enough to hold a
+  maximum-length extent would have failed the restore outright rather than
+  silently -- unreachable in practice, but wrong.
+- `ext4.go:176` passes `GetLen()` to the address check added in §7. With the
+  length reported as zero, that check validated an empty range, so §7's
+  guarantee did not apply to precisely the extents where a bad address would do
+  the most damage.
+
+The behaviour was also pinned by a test. `TestExtent_IsUninitialized` carried a
+case asserting that `0x8000` meant "uninitialized, 0 blocks", so the suite
+agreed with the reader rather than with the on-disk format. That case is now
+corrected, and `TestExtentLenBoundary` covers the whole boundary --
+32766, 32767, **32768**, 32769, 40000, 65535 -- with `32768` being the row no
+earlier test could have covered.
+
+---
+
+## 9. Results
 
 | | before | after | |
 | --- | --- | --- | --- |
@@ -353,7 +439,7 @@ before deciding it is worth the churn.
 
 ---
 
-## 9. Correctness
+## 10. Correctness
 
 None of the performance changes alter what the reader returns, only how much
 work it does to return it. The capability changes add what was missing without
@@ -373,6 +459,14 @@ than fixtures -- a valid image cannot contain a bad address, so the cases have
 to be built by hand. Four of them: an address past the end, one exactly at the
 end, one starting inside the filesystem but running past the end, and the
 boundary that must be *accepted*, an extent ending exactly on the last block.
+
+Section 8's extent length boundary is unit-tested for the same reason, and for
+one more: the value that mattered, 32768, was not merely untested but asserted
+*wrongly* by an existing case. A fixture would not have caught it either, since
+producing a maximum-length extent needs a file over 128 MiB and the suite's
+images are small. The boundary is now pinned at 32766, 32767, 32768, 32769,
+40000 and 65535, plus a three-extent map that fails if a full-length extent is
+ever dropped again.
 
 File contents are checked against checksums taken from the source tree before
 it was written into the image, and metadata against `debugfs`, the reference

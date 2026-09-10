@@ -91,7 +91,11 @@ func TestExtent_IsUninitialized(t *testing.T) {
 		{"uninitialized: 1 block (0x8001)", 0x8001, true, 1},
 		{"uninitialized: max (0xFFFF)", 0xFFFF, true, 0x7FFF},
 		{"zero length", 0, false, 0},
-		{"exactly 0x8000 (uninitialized, 0 blocks)", 0x8000, true, 0},
+		// 0x8000 is EXT_INIT_MAX_LEN: a *written* extent of the maximum
+		// length ext4 can describe, not an unwritten one. The boundary is a
+		// comparison against 32768, not a test of bit 15, and this is the one
+		// value where those two disagree. See TestExtentLenBoundary.
+		{"exactly 0x8000 (written, max length)", 0x8000, false, 0x8000},
 	}
 
 	for _, tt := range tests {
@@ -150,5 +154,80 @@ func TestInodeFileTypeMutualExclusion(t *testing.T) {
 				t.Errorf("expected exactly 1 type match for mode %#o, got %d", m.mode, count)
 			}
 		})
+	}
+}
+
+// TestExtentLenBoundary pins the written/unwritten boundary.
+//
+// ext4 packs a block count and the unwritten flag into one 16-bit field by
+// splitting its range at EXT_INIT_MAX_LEN (32768) rather than reserving a bit.
+// A bit-15 test agrees with the real rule everywhere except at 32768 itself,
+// which has the bit set but is a written extent of maximum length -- so that
+// row is the whole point of this table.
+//
+// Getting it wrong is silent: fs.go's file() skips extents it believes are
+// unwritten, so a dropped 32768-block extent leaves a 128 MiB hole in the
+// block table and Read() serves zeros for it. No error anywhere.
+func TestExtentLenBoundary(t *testing.T) {
+	tests := []struct {
+		name   string
+		raw    uint16
+		uninit bool
+		length uint16
+	}{
+		{"empty", 0, false, 0},
+		{"one block", 1, false, 1},
+		{"written, one under the boundary", 32766, false, 32766},
+		{"written, just under the boundary", 32767, false, 32767},
+		{"written, maximum length", 32768, false, 32768},
+		{"unwritten, one block", 32769, true, 1},
+		{"unwritten, mid range", 40000, true, 7232},
+		{"unwritten, maximum length", 65535, true, 32767},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := Extent{Len: tt.raw}
+			if got := e.IsUninitialized(); got != tt.uninit {
+				t.Errorf("Extent{Len: %d}.IsUninitialized() = %v, want %v",
+					tt.raw, got, tt.uninit)
+			}
+			if got := e.GetLen(); got != tt.length {
+				t.Errorf("Extent{Len: %d}.GetLen() = %d, want %d",
+					tt.raw, got, tt.length)
+			}
+		})
+	}
+}
+
+// TestExtentMaxLenReachesBlockTable is the regression this fix exists for.
+//
+// A file built by the skeleton plugin gets extents capped at
+// EXT4_MAX_EXTENT_BLOCKS, which is exactly 32768 -- so every file over 128 MiB
+// carries at least one maximum-length extent. Under the old bit-15 test those
+// extents reported IsUninitialized() == true and GetLen() == 0, were skipped
+// when the block table was built, and read back as zeros.
+func TestExtentMaxLenReachesBlockTable(t *testing.T) {
+	// A three-extent file: a short run, then a maximum-length run, then the
+	// remainder. Only the middle one sits on the boundary.
+	extents := []Extent{
+		{Block: 0, Len: 15321},
+		{Block: 15321, Len: 32768},
+		{Block: 48089, Len: 31743},
+	}
+
+	var total uint32
+	for _, e := range extents {
+		if e.IsUninitialized() {
+			t.Fatalf("extent at logical block %d (Len %d) was treated as "+
+				"unwritten; its blocks would be missing from the block table "+
+				"and read back as zeros", e.Block, e.Len)
+		}
+		total += uint32(e.GetLen())
+	}
+
+	const want = 15321 + 32768 + 31743
+	if total != want {
+		t.Errorf("extents cover %d blocks, want %d", total, want)
 	}
 }
