@@ -1,4 +1,4 @@
-module github.com/dipayan-trilio/go-ext4-filesystem
+module github.com/trilioData/go-ext4-filesystem
 
 go 1.18
 

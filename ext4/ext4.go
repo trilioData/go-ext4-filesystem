@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/xerrors"
 
-	"github.com/dipayan-trilio/go-ext4-filesystem/log"
+	"github.com/trilioData/go-ext4-filesystem/log"
 )
 
 /*
