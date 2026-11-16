@@ -27,6 +27,12 @@ Every section has a plain description first and a fuller one after it.
 | `ext4/file_test.go` | modified | tests for the accessors in §1 |
 | `ext4/ext4_test.go` | modified | tests for the address check in §7; block count added to fixtures |
 | `ext4/inode_test.go` | modified | extent length boundary tests (§8); corrects a case that asserted the old behaviour |
+| `ext4/acl.go` | **new** | convert POSIX ACLs from the ext4 disk format to the xattr format (§11) |
+| `ext4/xattr.go` | modified | return ACL values in xattr format (§11) |
+| `ext4/fs.go` | modified | symlink fixes: long targets on block-mapped filesystems, verbatim targets, relative resolution, loop detection, `Lstat` (§12) |
+| `ext4/acl_test.go`, `ext4/image_test.go`, `ext4/api_test.go` | **new** | unit tests and tests against real ext4 images (§13) |
+| `e2e/`, `scripts/e2e-*.sh` | **new** | end-to-end clone test against a kernel-mounted disk (§13) |
+| `.github/workflows/test.yml` | **new** | CI on pull requests and on pushes to master/main (§13) |
 
 Roughly 1,060 lines added across the fork.
 
@@ -473,3 +479,110 @@ it was written into the image, and metadata against `debugfs`, the reference
 tool from e2fsprogs.
 
 All of it passes.
+
+---
+
+## 11. POSIX ACLs came back in a format setxattr rejects
+
+### In plain terms
+
+**Issue.** ext4 stores ACLs on disk in its own compact format. The kernel
+converts them to the standard format whenever a program reads them. This
+library reads the disk directly, so it returned the disk format, and a restore
+passing that value to `setxattr` got `EOPNOTSUPP`. The ACL was lost, and
+because a file with an ACL keeps the ACL mask in its group permission bits,
+the restored file's group gained the mask's permissions (for example `r--`
+became `rw-`).
+
+**Change.** `ListXattrs` converts `system.posix_acl_access` and
+`system.posix_acl_default` to the format `getxattr(2)` returns. Every other
+value is still returned raw.
+
+**Result.** An ACL read from an image is byte-identical to what the kernel
+reports for the same file, and can be passed straight to `setxattr`.
+
+### In more detail
+
+On disk (`fs/ext4/acl.h`): a version-1 header, then entries of tag and
+permission, with a 32-bit id only for named users and groups. The xattr format
+(`posix_acl_xattr`): a version-2 header, every entry 8 bytes, and
+`ACL_UNDEFINED_ID` (`0xffffffff`) where there is no id. `ext4ACLToXattr`
+mirrors `ext4_acl_from_disk` and `convert_disk_buffer_to_posix_acl` in
+e2fsprogs. A value already at version 2 is passed through; anything else that
+does not parse is an error rather than a value that would fail later.
+
+Found by backing up an XFS volume with an ACL and tracing the restore's
+`setxattr` calls.
+
+---
+
+## 12. Symlinks
+
+### In plain terms
+
+**Issues.**
+
+- Reading a long symlink (60 bytes or more) on a filesystem without extents
+  panicked with a slice-bounds error. The code decided where the target lives
+  by "does the inode use extents" instead of "is the target in the inode".
+- `ReadLink` cleaned the target (`./a/../b` came back as `b`), so a restore
+  recreated a different link.
+- `Open` and `Stat` resolved a relative target from the filesystem root
+  instead of the link's directory, so `sub/link -> ../file` opened the wrong
+  path or nothing, and a symlink loop recursed until the stack overflowed.
+- `Lstat` was `Stat`, so it followed the link.
+
+**Changes.**
+
+- A target is in the inode exactly when the link owns no data blocks other
+  than an xattr block (the kernel's `ext4_inode_is_fast_symlink`). Otherwise
+  it is read through the extent tree or the block map, whichever the inode
+  uses.
+- `ReadLink` returns the target verbatim, as `readlink(2)` does.
+- `Open` and `Stat` follow a symlink in the final component relative to the
+  link's own directory, absolute targets from the root, and stop after 40
+  links with `ErrSymlinkLoop`. `..` cannot climb above the root.
+- `Lstat` describes the link itself.
+
+Symlinks in intermediate path components are still not followed, as before.
+
+---
+
+## 13. Tests and CI
+
+The fork now carries its own tests against real images, in addition to the
+unit tests.
+
+- **Image tests** (`ext4/image_test.go`, `ext4/api_test.go`). A source tree is
+  built in a temporary directory, made into an image with `mke2fs -d` (no root
+  needed), adjusted with `debugfs` for what an unprivileged user cannot create
+  (owners above 65535, root-owned files, device nodes, `security.*` and
+  `trusted.*` attributes), and read back. Every entry is compared with the
+  source: type and all mode bits, owner, mtime, size and contents, symlink
+  targets, directory listings, hardlink identity and link count, and every
+  xattr byte for byte, ACLs included. Five geometries: the skeleton plugin's
+  (4 KiB blocks, 512-byte inodes), stock ext4 with a journal, 1 KiB blocks,
+  128-byte inodes, and ext3-style block maps. The trees include sizes either
+  side of block boundaries, sparse and fragmented files (an extent tree with
+  an index level), a 129 MiB file (maximum-length extent) and a 66 MiB file on
+  1 KiB block maps (triple-indirect blocks), a 3,000-entry hash-tree
+  directory, deep paths, 255-byte and non-ASCII names, every symlink shape
+  including loops, and large and many xattrs. Further tests cover path forms,
+  error values, symlink resolution, `Lstat`, a filesystem at a partition
+  offset, eight unsupported features refused by name, and damaged input
+  returning errors instead of panicking. `-short` skips the large files.
+  The e2fsprogs tools are required; without them the tests skip, or fail when
+  `EXT4_REQUIRE_TOOLS` is set.
+- **End-to-end clone** (`e2e/`, `scripts/e2e-clone.sh`, root). A disk image is
+  formatted with `mkfs.ext4`, populated through a kernel mount (including
+  device nodes, sockets, owners up to 4294967294, nanosecond and post-2038
+  timestamps, inherited default ACLs), cloned with this library by a minimal
+  restorer, and compared with the kernel-mounted original, in Go and again
+  with `rsync -naHAXc`.
+- **CI** (`.github/workflows/test.yml`) runs on every pull request and on
+  pushes to `master` and `main`: gofmt, vet, the unit and image tests with
+  `-race` on Ubuntu 22.04 and 24.04 (e2fsprogs 1.46 and 1.47), and the
+  end-to-end clone on four mkfs geometries.
+
+Statement coverage of `ext4/` went from 42% to 84%. Both the ACL bug (§11)
+and the block-map symlink panic (§12) fail these tests on the previous code.

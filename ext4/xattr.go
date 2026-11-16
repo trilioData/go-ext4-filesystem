@@ -60,7 +60,9 @@ func (ext4 *FileSystem) inodeOffset(inodeAddress int64) (int64, error) {
 }
 
 // ListXattrs returns every extended attribute on an inode, keyed by full
-// name, with the raw value bytes.
+// name, with the value bytes as getxattr(2) would return them. Values are
+// raw except for POSIX ACLs (system.posix_acl_access/default), which are
+// converted from the ext4 on-disk format to the xattr format.
 //
 // Attributes live in one or two places and both are read:
 //
@@ -88,6 +90,19 @@ func (ext4 *FileSystem) ListXattrs(ino int64) (map[string][]byte, error) {
 	}
 	if err := ext4.readBlockXattrs(raw, out); err != nil {
 		return nil, xerrors.Errorf("inode %d xattr block: %w", ino, err)
+	}
+
+	// ACL values are stored in ext4's own format; hand back what getxattr(2)
+	// would return so the value can be passed straight to setxattr(2).
+	for name, value := range out {
+		if !isPosixACLXattr(name) {
+			continue
+		}
+		converted, err := ext4ACLToXattr(value)
+		if err != nil {
+			return nil, xerrors.Errorf("inode %d xattr %q: %w", ino, name, err)
+		}
+		out[name] = converted
 	}
 
 	if len(out) == 0 {
