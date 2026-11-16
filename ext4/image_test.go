@@ -931,3 +931,34 @@ func TestImageCorruptInput(t *testing.T) {
 		})
 	})
 }
+
+// A damaged symlink inode with a negative or oversized size is refused with
+// an error, before anything is sliced or allocated from it.
+func TestImageCorruptSymlinkSize(t *testing.T) {
+	cfg := imageConfigs[0]
+	tr := buildSourceTree(t, cfg, false)
+	img := buildImage(t, cfg, tr.dir, tr.debugfs)
+	// Applied after buildImage, whose e2fsck pass would repair it.
+	out := run(t, strings.Join([]string{
+		"sif /links/fast-rel size 100000",        // larger than a block
+		"sif /links/slow-rel size_hi 0x80000000", // negative as int64
+	}, "\n")+"\n", "debugfs", "-w", "-f", "-", img)
+	for _, line := range strings.Split(out, "\n") {
+		if line != "" && !strings.HasPrefix(line, "debugfs") {
+			t.Fatalf("debugfs reported: %q", line)
+		}
+	}
+	fsys := openImage(t, img, 0)
+	for _, link := range []string{"links/fast-rel", "links/slow-rel"} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("ReadLink(%q) panicked: %v", link, r)
+				}
+			}()
+			if _, err := fsys.ReadLink(link); err == nil || !strings.Contains(err.Error(), "symlink size") {
+				t.Errorf("ReadLink(%q) = %v, want a symlink size error", link, err)
+			}
+		}()
+	}
+}
