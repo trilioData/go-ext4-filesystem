@@ -73,4 +73,5 @@ jobs:
       - name: Format, populate, clone and compare
         env:
           MKFS_OPTS: ${{ matrix.mkfs }}
-        run: sudo -E env "PATH=$PATH" scripts/e2e-clone.sh ${{ matrix.big }}
+        # sudo on the runners refuses -E, so pass what the script needs explicitly.
+        run: sudo env "PATH=$PATH" "MKFS_OPTS=$MKFS_OPTS" scripts/e2e-clone.sh ${{ matrix.big }}

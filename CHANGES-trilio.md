@@ -584,5 +584,10 @@ unit tests.
   `-race` on Ubuntu 22.04 and 24.04 (e2fsprogs 1.46 and 1.47), and the
   end-to-end clone on four mkfs geometries.
 
+The feature gate now also accepts `metadata_csum_seed`. It only records where
+the checksum seed lives, this reader does not verify checksums, and
+`mkfs.ext4` enables it by default from e2fsprogs 1.47.1 (Ubuntu 24.04 runners),
+so stock filesystems from current distributions were being refused.
+
 Statement coverage of `ext4/` went from 42% to 84%. Both the ACL bug (§11)
 and the block-map symlink panic (§12) fail these tests on the previous code.

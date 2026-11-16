@@ -70,6 +70,10 @@ var imageConfigs = []imageConfig{
 	// 128-byte inodes: no room for inline xattrs or nanosecond times.
 	{"ext4-4k-i128", 4096, 128,
 		baseFeatures + ",extent,64bit,flex_bg,huge_file,dir_nlink", 96},
+	// mkfs.ext4 defaults from e2fsprogs 1.47.1: the checksum seed is stored
+	// in the superblock.
+	{"ext4-4k-i256-csum-seed", 4096, 256,
+		baseFeatures + ",has_journal,extent,64bit,flex_bg,huge_file,dir_nlink,extra_isize,metadata_csum,metadata_csum_seed", 96},
 	// ext3-style block maps (no extents): direct and indirect blocks.
 	{"ext3-1k-blockmap", 1024, 256, baseFeatures + ",has_journal", 96},
 }
@@ -411,7 +415,7 @@ func buildSourceTree(t *testing.T, cfg imageConfig, big bool) *tree {
 
 	// Large files, only in long mode.
 	if big {
-		if cfg.features == imageConfigs[4].features {
+		if cfg.name == "ext3-1k-blockmap" {
 			// > 64 MiB of 1 KiB blocks reaches the triple-indirect block.
 			writeFile(t, filepath.Join(src, "large", "triple-indirect.bin"), randBytes(rng, 66<<20), 0o644)
 		} else {
@@ -835,7 +839,6 @@ func TestImageUnsupportedFeatures(t *testing.T) {
 	}{
 		{"inline_data", nil, "inline_data"},
 		{"bigalloc", []string{"-C", "16384"}, "bigalloc"},
-		{"metadata_csum,metadata_csum_seed", nil, "metadata_csum_seed"},
 		{"encrypt", nil, "encrypt"},
 		{"casefold", nil, "casefold"},
 		{"ea_inode", nil, "ea_inode"},
