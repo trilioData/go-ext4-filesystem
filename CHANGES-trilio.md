@@ -560,9 +560,9 @@ unit tests.
   `trusted.*` attributes), and read back. Every entry is compared with the
   source: type and all mode bits, owner, mtime, size and contents, symlink
   targets, directory listings, hardlink identity and link count, and every
-  xattr byte for byte, ACLs included. Five geometries: the skeleton plugin's
+  xattr byte for byte, ACLs included. Six geometries: the skeleton plugin's
   (4 KiB blocks, 512-byte inodes), stock ext4 with a journal, 1 KiB blocks,
-  128-byte inodes, and ext3-style block maps. The trees include sizes either
+  128-byte inodes, metadata_csum_seed (the e2fsprogs 1.47.1+ default), and ext3-style block maps. The trees include sizes either
   side of block boundaries, sparse and fragmented files (an extent tree with
   an index level), a 129 MiB file (maximum-length extent) and a 66 MiB file on
   1 KiB block maps (triple-indirect blocks), a 3,000-entry hash-tree
@@ -582,11 +582,12 @@ unit tests.
 - **CI** (`.github/workflows/test.yml`) runs on every pull request and on
   pushes to `master` and `main`: gofmt, vet, the unit and image tests with
   `-race` on Ubuntu 22.04 and 24.04 (e2fsprogs 1.46 and 1.47), and the
-  end-to-end clone on four mkfs geometries.
+  end-to-end clone with stock mkfs.ext4 on ubuntu-latest and ubuntu-22.04 plus
+  three pinned geometries on ubuntu-24.04.
 
 The feature gate now also accepts `metadata_csum_seed`. It only records where
 the checksum seed lives, this reader does not verify checksums, and
-`mkfs.ext4` enables it by default from e2fsprogs 1.47.1 (Ubuntu 24.04 runners),
+`mkfs.ext4` enables it by default from e2fsprogs 1.47.1 (ubuntu-latest runners),
 so stock filesystems from current distributions were being refused.
 
 Statement coverage of `ext4/` went from 42% to 84%. Both the ACL bug (§11)
