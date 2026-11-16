@@ -599,22 +599,62 @@ func (ext4 *FileSystem) listEntriesUncached(ino int64) ([]DirectoryEntry2, error
 	return entries, nil
 }
 
+// maxSymlinkFollows matches the kernel's MAXSYMLINKS.
+const maxSymlinkFollows = 40
+
+// ErrSymlinkLoop is returned when following symlinks does not terminate.
+var ErrSymlinkLoop = xerrors.New("too many levels of symbolic links")
+
+// resolveFollow resolves name to an inode, following a symlink in the final
+// component the way the kernel does: a relative target is taken relative to
+// the directory holding the link, an absolute one from the filesystem root.
+// It returns the path of the inode it ended on.
+//
+// Symlinks in intermediate components are not followed; resolvePath treats
+// them as non-directories.
+func (ext4 *FileSystem) resolveFollow(name string) (string, int64, *Inode, error) {
+	p := strings.Trim(path.Clean("/"+filepath.ToSlash(name)), "/")
+	for follows := 0; ; follows++ {
+		ino, err := ext4.resolvePath(p)
+		if err != nil {
+			return "", 0, nil, err
+		}
+		inode, err := ext4.getInode(ino)
+		if err != nil {
+			return "", 0, nil, xerrors.Errorf("failed to get inode(%d): %w", ino, err)
+		}
+		if !inode.IsSymlink() {
+			return p, ino, inode, nil
+		}
+		if follows == maxSymlinkFollows {
+			return "", 0, nil, ErrSymlinkLoop
+		}
+		target, err := ext4.ReadLink(p)
+		if err != nil {
+			return "", 0, nil, err
+		}
+		if !strings.HasPrefix(target, "/") {
+			target = path.Join(path.Dir("/"+p), target)
+		}
+		// Cleaning against "/" keeps ".." from climbing above the root.
+		p = strings.Trim(path.Clean("/"+target), "/")
+	}
+}
+
+// Stat returns the FileInfo of name, following a symlink in the final
+// component. Use Lstat to describe the link itself.
 func (ext4 *FileSystem) Stat(name string) (fs.FileInfo, error) {
 	const op = "stat"
 
-	f, err := ext4.Open(name)
+	_, ino, inode, err := ext4.resolveFollow(name)
 	if err != nil {
-		info, err := ext4.ReadDirInfo(name)
-		if err != nil {
-			return nil, ext4.wrapError(op, name, xerrors.Errorf("failed to read dir info: %w", err))
-		}
-		return info, nil
+		return nil, ext4.wrapError(op, name, err)
 	}
-	info, err := f.Stat()
-	if err != nil {
-		return nil, xerrors.Errorf("failed to stat file: %w", err)
-	}
-	return info, nil
+	return FileInfo{
+		name:  path.Base("/" + strings.Trim(filepath.ToSlash(name), "/")),
+		ino:   ino,
+		inode: inode,
+	}, nil
 }
 
 // ReadDirInfo returns the FileInfo of one path.
@@ -663,29 +703,18 @@ func (ext4 *FileSystem) Open(name string) (fs.File, error) {
 	}
 
 	// Resolve to a single inode rather than listing the parent directory and
-	// scanning it, which read an inode per sibling.
-	ino, err := ext4.resolvePath(trimmed)
+	// scanning it, which read an inode per sibling. A symlink is followed
+	// relative to its own directory, with loop detection.
+	resolved, ino, inode, err := ext4.resolveFollow(trimmed)
 	if err != nil {
 		return nil, ext4.wrapError(op, name, err)
 	}
-
-	inode, err := ext4.getInode(ino)
-	if err != nil {
-		return nil, ext4.wrapError(op, name, xerrors.Errorf("failed to get inode(%d): %w", ino, err))
-	}
+	trimmed = resolved
 
 	// A directory is not openable as a file, matching the previous behaviour
 	// where directory entries were skipped by the scan.
 	if inode.IsDir() {
 		return nil, ext4.wrapError(op, name, fs.ErrNotExist)
-	}
-
-	if inode.IsSymlink() {
-		link, err := ext4.ReadLink(trimmed)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to read link: %w", err)
-		}
-		return ext4.Open(link)
 	}
 
 	_, fileName := filepath.Split(trimmed)
@@ -721,15 +750,33 @@ func (ext4 *FileSystem) ReadLink(name string) (string, error) {
 		return "", xerrors.Errorf("file is not symlink: %w", fs.ErrInvalid)
 	}
 
-	// Depending on the target size, it is stored either in the inode block or the extents
+	// The target is returned verbatim, as readlink(2) does. Cleaning it would
+	// change its meaning when a component is itself a symlink, and a restore
+	// has to recreate the link exactly.
 	targetSize := inode.GetSize()
-	if !inode.UsesExtents() {
-		path := string(inode.BlockOrExtents[:targetSize])
-		return filepath.Clean(path), nil
+	// A symlink target is at most one block (PATH_MAX is 4096). A larger or
+	// negative size is a damaged inode: refuse it rather than slicing or
+	// allocating from it.
+	if targetSize < 0 || targetSize > ext4.sb.GetBlockSize() {
+		return "", xerrors.Errorf("symlink size %d is invalid", targetSize)
+	}
+	if ext4.isFastSymlink(inode) {
+		// A short target lives in the 60 bytes that otherwise hold the
+		// block map or extent tree.
+		if targetSize > int64(len(inode.BlockOrExtents)) {
+			return "", xerrors.Errorf("fast symlink target of %d bytes exceeds the inode", targetSize)
+		}
+		return string(inode.BlockOrExtents[:targetSize]), nil
 	}
 
-	// For symlinks stored in extents, read the target using the File abstraction
-	f, err := ext4.file(fi, name)
+	// A longer target is stored in a data block, mapped either by extents or
+	// by the classic block map.
+	var f *File
+	if inode.UsesExtents() {
+		f, err = ext4.file(fi, name)
+	} else {
+		f, err = ext4.fileFromBlock(fi, name)
+	}
 	if err != nil {
 		return "", xerrors.Errorf("failed to create file reader: %w", err)
 	}
@@ -739,12 +786,29 @@ func (ext4 *FileSystem) ReadLink(name string) (string, error) {
 	if err != nil {
 		return "", xerrors.Errorf("failed to read symlink target: %w", err)
 	}
-
-	return filepath.Clean(string(target)), nil
+	return string(target), nil
 }
 
+// isFastSymlink reports whether a symlink's target is stored in the inode
+// itself. Same test as ext4_inode_is_fast_symlink in the kernel: the link owns
+// no data blocks other than an xattr block.
+func (ext4 *FileSystem) isFastSymlink(inode *Inode) bool {
+	blocks := uint64(inode.BlocksHigh)<<32 | uint64(inode.BlocksLo) // 512-byte units
+	var eaBlocks uint64
+	if inode.FileACLLo != 0 || inode.FileACLHigh != 0 {
+		eaBlocks = uint64(ext4.sb.GetBlockSize()) / 512
+	}
+	return blocks <= eaBlocks
+}
+
+// Lstat returns the FileInfo of name without following a symlink in the final
+// component.
 func (ext4 *FileSystem) Lstat(name string) (fs.FileInfo, error) {
-	return ext4.Stat(name)
+	info, err := ext4.ReadDirInfo(name)
+	if err != nil {
+		return nil, ext4.wrapError("lstat", name, err)
+	}
+	return info, nil
 }
 
 func (ext4 *FileSystem) fileFromBlock(fi FileInfo, filePath string) (*File, error) {

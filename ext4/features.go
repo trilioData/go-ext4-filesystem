@@ -57,10 +57,16 @@ const (
 	// INCOMPAT features MUST be understood. An unknown bit here means the
 	// on-disk layout is something this reader cannot interpret, and
 	// carrying on would return wrong bytes rather than an error.
+	//
+	// CSUM_SEED only says where the metadata checksum seed comes from (stored
+	// in the superblock rather than derived from the UUID). This reader does
+	// not verify checksums, so the layout it reads is unchanged. mkfs.ext4
+	// enables it by default from e2fsprogs 1.47.1.
 	supportedIncompat = FEATURE_INCOMPAT_FILETYPE |
 		FEATURE_INCOMPAT_EXTENTS |
 		FEATURE_INCOMPAT_64BIT |
-		FEATURE_INCOMPAT_FLEX_BG
+		FEATURE_INCOMPAT_FLEX_BG |
+		FEATURE_INCOMPAT_CSUM_SEED
 )
 
 type featureName struct {
