@@ -46,22 +46,32 @@ jobs:
   # and with rsync). Needs root for mount, mknod and chown.
   e2e-clone:
     name: e2e clone (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: stock mkfs.ext4
+          # Stock defaults on the newest runner, so new mkfs.ext4 defaults
+          # show up here first.
+          - name: stock mkfs.ext4 (latest runner)
+            os: ubuntu-latest
+            mkfs: ""
+            big: ""
+          - name: stock mkfs.ext4 (ubuntu-22.04)
+            os: ubuntu-22.04
             mkfs: ""
             big: ""
           - name: skeleton layout, 512-byte inodes, no journal
-            mkfs: "-I 512 -O ^has_journal"
+            os: ubuntu-24.04
+            mkfs: "-I 512 -O ^has_journal,^orphan_file"
             big: big
           - name: 1 KiB blocks, 128-byte inodes
+            os: ubuntu-24.04
             mkfs: "-b 1024 -I 128"
             big: ""
           - name: ext3-style block maps
-            mkfs: "-b 1024 -O ^extent,^64bit,^flex_bg,^huge_file,^metadata_csum"
+            os: ubuntu-24.04
+            mkfs: "-b 1024 -O ^extent,^64bit,^flex_bg,^huge_file,^metadata_csum,^metadata_csum_seed"
             big: big
     steps:
       - uses: actions/checkout@v4

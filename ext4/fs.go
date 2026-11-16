@@ -754,6 +754,12 @@ func (ext4 *FileSystem) ReadLink(name string) (string, error) {
 	// change its meaning when a component is itself a symlink, and a restore
 	// has to recreate the link exactly.
 	targetSize := inode.GetSize()
+	// A symlink target is at most one block (PATH_MAX is 4096). A larger or
+	// negative size is a damaged inode: refuse it rather than slicing or
+	// allocating from it.
+	if targetSize < 0 || targetSize > ext4.sb.GetBlockSize() {
+		return "", xerrors.Errorf("symlink size %d is invalid", targetSize)
+	}
 	if ext4.isFastSymlink(inode) {
 		// A short target lives in the 60 bytes that otherwise hold the
 		// block map or extent tree.

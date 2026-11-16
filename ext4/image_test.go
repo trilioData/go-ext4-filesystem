@@ -403,6 +403,9 @@ func buildSourceTree(t *testing.T, cfg imageConfig, big bool) *tree {
 	err2 := syscall.Setxattr(filepath.Join(src, "acl", "dir"), XattrPosixACLDefault, def, 0)
 	tr.aclsOK = err1 == nil && err2 == nil
 	if !tr.aclsOK {
+		if os.Getenv("EXT4_REQUIRE_TOOLS") != "" {
+			t.Fatalf("source filesystem does not take ACLs (%v, %v) and EXT4_REQUIRE_TOOLS is set", err1, err2)
+		}
 		t.Logf("source filesystem does not take ACLs (%v, %v); ACL checks skipped", err1, err2)
 	}
 
@@ -911,9 +914,20 @@ func TestImageCorruptInput(t *testing.T) {
 		if err != nil {
 			return
 		}
-		_ = filepath.WalkDir(".", func(string, fs.DirEntry, error) error { return nil })
-		if f, err := fsys.Open("sizes/f1048576"); err == nil {
-			_, _ = io.ReadAll(f)
-		}
+		// Walk and read everything; errors are fine, panics are not.
+		_ = fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if d.Type()&fs.ModeSymlink != 0 {
+				_, _ = fsys.ReadLink(p)
+				return nil
+			}
+			_, _ = fsys.ListXattrs(d.(dirEntry).InodeNumber())
+			if f, err := fsys.Open(p); err == nil {
+				_, _ = io.ReadAll(f)
+			}
+			return nil
+		})
 	})
 }
