@@ -1,10 +1,11 @@
 package ext4
 
 import (
-	"bytes"
+	"errors"
 	"io"
 	"io/fs"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"golang.org/x/xerrors"
@@ -19,16 +20,33 @@ var (
 // File is implemented io/fs File interface
 type File struct {
 	FileInfo
-	fs           *FileSystem
-	buffer       *bytes.Buffer
-	filePath     string
-	currentBlock int64
-	size         int64
-	blockSize    int64
-	table        dataTable
+	fs        *FileSystem
+	filePath  string
+	pos       int64 // byte offset of the next Read
+	size      int64
+	blockSize int64
+
+	// runs maps the file's logical blocks to physical ones, sorted by
+	// logical block and non-overlapping. A logical block no run covers is a
+	// hole and reads as zeros.
+	//
+	// This used to be a map with one entry per block, built on every Open
+	// and held for the whole read: ~6.5 GiB of heap for a 1 TiB file. One
+	// entry per contiguous run costs the same whatever the file size.
+	runs []blockRun
+	// lastRun is the index of the run the previous Read used. Reads are
+	// sequential, so the next block is nearly always in that run or the one
+	// after it and the binary search is skipped.
+	lastRun int
 }
 
-type dataTable map[int64]int64
+// blockRun is a run of count logical blocks starting at logical, stored
+// contiguously on the device starting at block physical.
+type blockRun struct {
+	logical  int64
+	physical int64
+	count    int64
+}
 
 // FileInfo is implemented io/fs FileInfo interface
 type FileInfo struct {
@@ -131,49 +149,88 @@ func (f *File) Stat() (fs.FileInfo, error) {
 	return &f.FileInfo, nil
 }
 
-func (f *File) Read(p []byte) (n int, err error) {
-	if f.buffer == nil {
+// findRun returns the run covering logical block blk. When blk is in a hole
+// it returns nil and the logical block at which the hole ends, or -1 if the
+// hole runs to the end of the file.
+func (f *File) findRun(blk int64) (*blockRun, int64) {
+	i := f.lastRun
+	if i >= len(f.runs) || f.runs[i].logical > blk ||
+		(i+1 < len(f.runs) && f.runs[i+1].logical <= blk) {
+		// Last run starting at or before blk; -1 if there is none.
+		i = sort.Search(len(f.runs), func(k int) bool {
+			return f.runs[k].logical > blk
+		}) - 1
+	}
+	if i >= 0 {
+		f.lastRun = i
+		if r := &f.runs[i]; blk < r.logical+r.count {
+			return r, 0
+		}
+	}
+	if i+1 < len(f.runs) {
+		return nil, f.runs[i+1].logical
+	}
+	return nil, -1
+}
+
+// Read fills p with as much as one contiguous piece of the file allows: up to
+// the end of the current run of blocks, the end of the current hole, or the
+// end of the file. A piece of stored data is fetched with a single ReadAt.
+//
+// ReadAt does not use the offset of the reader the FileSystem shares between
+// its Files, so different Files can be read concurrently. A single File is
+// not safe for concurrent use.
+func (f *File) Read(p []byte) (int, error) {
+	if f.pos >= f.size {
 		return 0, io.EOF
 	}
-	if f.buffer.Len() == 0 {
-		f.currentBlock++
-		if f.currentBlock*f.blockSize >= f.Size() {
-			f.buffer = nil
-			return 0, io.EOF
-		}
-	} else {
-		return f.buffer.Read(p)
+	if len(p) == 0 {
+		return 0, nil
 	}
 
-	offset, ok := f.table[f.currentBlock]
-	if !ok {
-		remaining := f.Size() - f.blockSize*f.currentBlock
-		if remaining < f.blockSize {
-			f.buffer.Write(make([]byte, remaining))
-		} else {
-			f.buffer.Write(make([]byte, f.blockSize))
+	n := f.size - f.pos
+	run, holeEnd := f.findRun(f.pos / f.blockSize)
+	switch {
+	case run != nil:
+		if left := (run.logical+run.count)*f.blockSize - f.pos; left < n {
+			n = left
 		}
-	} else {
-		_, err := f.fs.r.Seek(offset, io.SeekStart)
-		if err != nil {
-			return 0, xerrors.Errorf("failed to seek block: %w", err)
-		}
-		buf, err := readBlock(f.fs.r, f.blockSize)
-		if err != nil {
-			return 0, xerrors.Errorf("failed to read block: %w", err)
-		}
-
-		b := buf.Bytes()
-		if f.Size()-f.blockSize*f.currentBlock < f.blockSize {
-			b = b[:f.Size()-f.blockSize*f.currentBlock]
-		}
-		n, err := f.buffer.Write(b)
-		if n != len(b) {
-			return 0, xerrors.Errorf("write buffer error: actual(%d), expected(%d)", n, len(b))
+	case holeEnd >= 0:
+		if left := holeEnd*f.blockSize - f.pos; left < n {
+			n = left
 		}
 	}
+	if int64(len(p)) < n {
+		n = int64(len(p))
+	}
+	p = p[:n]
 
-	return f.buffer.Read(p)
+	if run == nil {
+		for i := range p {
+			p[i] = 0
+		}
+		f.pos += n
+		return int(n), nil
+	}
+
+	offset := run.physical*f.blockSize + (f.pos - run.logical*f.blockSize)
+	rn, err := f.fs.r.ReadAt(p, offset)
+	if rn != len(p) {
+		// The device ended inside a run the filesystem says is there. That
+		// is not the end of the file, and must not look like it to a caller
+		// testing with errors.Is(err, io.EOF): the file would be taken as
+		// complete and come out short.
+		if err == nil || errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		return 0, xerrors.Errorf("failed to read block: actual(%d), expected(%d): %w", rn, len(p), err)
+	}
+	// io.ReaderAt may return io.EOF along with a full read at the end of the input.
+	if err != nil && !errors.Is(err, io.EOF) {
+		return 0, xerrors.Errorf("failed to read block: %w", err)
+	}
+	f.pos += n
+	return int(n), nil
 }
 
 func (f *File) Close() error {

@@ -3,14 +3,24 @@ package ext4
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"io/fs"
+	"sync"
 	"testing"
 )
 
 // newTestFile creates a File with the given parameters for testing Read().
 // The dataTable maps logical block numbers to byte offsets in the image.
 func newTestFile(image []byte, blockSize int64, fileSize int64, table dataTable) *File {
+	// One single-block run per mapped block, in logical order.
+	var runs []blockRun
+	for blk := int64(0); blk*blockSize < fileSize; blk++ {
+		if offset, ok := table[blk]; ok {
+			runs = append(runs, blockRun{logical: blk, physical: offset / blockSize, count: 1})
+		}
+	}
+
 	r := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
 	fs := &FileSystem{r: r}
 	inode := &Inode{SizeLo: uint32(fileSize)}
@@ -20,14 +30,15 @@ func newTestFile(image []byte, blockSize int64, fileSize int64, table dataTable)
 			name:  "test",
 			inode: inode,
 		},
-		fs:           fs,
-		currentBlock: -1,
-		buffer:       bytes.NewBuffer(nil),
-		blockSize:    blockSize,
-		table:        table,
-		size:         fileSize,
+		fs:        fs,
+		blockSize: blockSize,
+		runs:      runs,
+		size:      fileSize,
 	}
 }
+
+// dataTable maps a logical block number to a byte offset in the image.
+type dataTable map[int64]int64
 
 func readAll(t *testing.T, f *File) []byte {
 	t.Helper()
@@ -217,6 +228,62 @@ func TestReadDirInfoRootSetsInodeNumber(t *testing.T) {
 	}
 }
 
+func TestFileRead_Concurrent(t *testing.T) {
+	// Two Files opened from the same FileSystem (sharing the same reader) point
+	// to different block ranges. Reading them concurrently must not mix up the
+	// data, which happens if Read depends on the reader's shared offset.
+	const blockSize = 1024
+	const blocksPerFile = 64
+	const fileSize = blockSize * blocksPerFile
+
+	// Every block in the image has a distinct byte value, so reading a wrong
+	// block is always detected.
+	image := make([]byte, blockSize*blocksPerFile*2)
+	for i := 0; i < blocksPerFile*2; i++ {
+		for j := 0; j < blockSize; j++ {
+			image[i*blockSize+j] = byte(i)
+		}
+	}
+
+	table1 := dataTable{}
+	table2 := dataTable{}
+	for i := int64(0); i < blocksPerFile; i++ {
+		table1[i] = i * blockSize
+		table2[i] = (i + blocksPerFile) * blockSize
+	}
+
+	f1 := newTestFile(image, blockSize, fileSize, table1)
+	f2 := newTestFile(image, blockSize, fileSize, table2)
+	f2.fs = f1.fs
+
+	// t.Fatal must not be called from other goroutines, so errors are
+	// collected here and checked after all reads finish.
+	var wg sync.WaitGroup
+	results := make([][]byte, 2)
+	errs := make([]error, 2)
+	for i, f := range []*File{f1, f2} {
+		wg.Add(1)
+		go func(i int, f *File) {
+			defer wg.Done()
+			results[i], errs[i] = io.ReadAll(f)
+		}(i, f)
+	}
+	wg.Wait()
+
+	want := [][]byte{
+		image[:fileSize],
+		image[fileSize:],
+	}
+	for i := range results {
+		if errs[i] != nil {
+			t.Fatalf("file %d: Read error: %v", i+1, errs[i])
+		}
+		if !bytes.Equal(results[i], want[i]) {
+			t.Errorf("file %d: read data does not match the expected block range", i+1)
+		}
+	}
+}
+
 func TestFileInfoMode(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -362,5 +429,303 @@ func TestFileRead_UninitializedExtentReadsZeros(t *testing.T) {
 		if data[i] != 0 {
 			t.Fatalf("byte %d (uninitialized): got %#x, want 0x00", i, data[i])
 		}
+	}
+}
+
+// countingReaderAt counts the ReadAt calls that reach the device.
+type countingReaderAt struct {
+	r     io.ReaderAt
+	calls int
+}
+
+func (c *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	c.calls++
+	return c.r.ReadAt(p, off)
+}
+
+// extentInode builds an inode whose extent tree is a single leaf in the inode
+// itself, which holds at most four extents.
+func extentInode(t *testing.T, size int64, extents ...Extent) *Inode {
+	t.Helper()
+	if len(extents) > 4 {
+		t.Fatalf("%d extents do not fit in an inode", len(extents))
+	}
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.LittleEndian, ExtentHeader{
+		Magic: 0xF30A, Entries: uint16(len(extents)), Max: 4, Depth: 0,
+	})
+	for _, e := range extents {
+		binary.Write(&buf, binary.LittleEndian, e)
+	}
+	inode := &Inode{SizeLo: uint32(size), SizeHigh: uint32(size >> 32), Flags: EXTENTS_FL}
+	copy(inode.BlockOrExtents[:], buf.Bytes())
+	return inode
+}
+
+// TestFileRead_ExtentsHolesUnwrittenShortTail reads a file laid out with
+// everything the run lookup has to get right -- extents out of physical
+// order, a hole between them, an unwritten extent, and a last block shorter
+// than a block -- and checks every byte, at buffer sizes that split blocks,
+// match them, and span whole extents.
+func TestFileRead_ExtentsHolesUnwrittenShortTail(t *testing.T) {
+	const blockSize = 4096
+	const fileSize = 11*blockSize + 100
+
+	// Every device byte is distinct per block and position, so a read from
+	// the wrong place never passes.
+	image := make([]byte, 64*blockSize)
+	for i := range image {
+		image[i] = byte(i/blockSize*7 + i%251 + 1)
+	}
+
+	inode := extentInode(t, fileSize,
+		Extent{Block: 0, Len: 3, StartLo: 40},      // blocks 0-2
+		Extent{Block: 5, Len: 2, StartLo: 10},      // blocks 3-4 are a hole
+		Extent{Block: 7, Len: 0x8002, StartLo: 20}, // blocks 7-8 unwritten
+		Extent{Block: 9, Len: 3, StartLo: 30},      // blocks 9-11, 11 is the short tail
+	)
+
+	want := make([]byte, fileSize)
+	copy(want[0:], image[40*blockSize:43*blockSize])
+	copy(want[5*blockSize:], image[10*blockSize:12*blockSize])
+	copy(want[9*blockSize:], image[30*blockSize:33*blockSize]) // cut at fileSize
+
+	for _, bufSize := range []int{1, 100, blockSize - 1, blockSize, blockSize + 1, 3 * blockSize, 1 << 20} {
+		ext4fs := &FileSystem{
+			r:  io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image))),
+			sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
+		}
+		f, err := ext4fs.file(FileInfo{name: "test", inode: inode}, "test")
+		if err != nil {
+			t.Fatalf("file(): %v", err)
+		}
+
+		var got []byte
+		buf := make([]byte, bufSize)
+		for {
+			// Poison the buffer: a hole must be written as zeros, not left
+			// holding whatever the previous read put there.
+			for i := range buf {
+				buf[i] = 0xEE
+			}
+			n, err := f.Read(buf)
+			got = append(got, buf[:n]...)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("buffer %d: Read: %v", bufSize, err)
+			}
+			if n == 0 {
+				t.Fatalf("buffer %d: Read returned 0 bytes and no error", bufSize)
+			}
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("buffer %d: read %d bytes that differ from the expected %d", bufSize, len(got), len(want))
+		}
+	}
+}
+
+// TestFileRead_OneReadAtPerRun pins the cost of a read. A caller with a large
+// buffer gets a whole extent per Read, fetched with one ReadAt. This used to
+// be one Read per block and eight 512-byte ReadAt calls under each.
+func TestFileRead_OneReadAtPerRun(t *testing.T) {
+	const blockSize = 4096
+	const fileSize = 512 * blockSize // 2 MiB
+
+	image := make([]byte, 600*blockSize)
+	for i := range image {
+		image[i] = byte(i/blockSize + i%13)
+	}
+	inode := extentInode(t, fileSize,
+		Extent{Block: 0, Len: 256, StartLo: 300},
+		Extent{Block: 256, Len: 256, StartLo: 8},
+	)
+
+	counter := &countingReaderAt{r: bytes.NewReader(image)}
+	ext4fs := &FileSystem{
+		r:  io.NewSectionReader(counter, 0, int64(len(image))),
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
+	}
+	f, err := ext4fs.file(FileInfo{name: "test", inode: inode}, "test")
+	if err != nil {
+		t.Fatalf("file(): %v", err)
+	}
+
+	var got []byte
+	reads := 0
+	buf := make([]byte, 4<<20)
+	for {
+		n, err := f.Read(buf)
+		got = append(got, buf[:n]...)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		reads++
+	}
+
+	want := append(append([]byte{}, image[300*blockSize:556*blockSize]...), image[8*blockSize:264*blockSize]...)
+	if !bytes.Equal(got, want) {
+		t.Fatal("read data does not match the extents")
+	}
+	if reads != 2 || counter.calls != 2 {
+		t.Errorf("%d Reads and %d device ReadAt calls for 2 extents, want 2 and 2", reads, counter.calls)
+	}
+}
+
+// TestFileOpen_MapsExtentsNotBlocks is the memory bound: what a File holds
+// grows with the number of extents, not the number of blocks. A fully
+// allocated 128 MiB extent is one entry, where the per-block map held 32768.
+func TestFileOpen_MapsExtentsNotBlocks(t *testing.T) {
+	const blockSize = 4096
+	inode := extentInode(t, 3*32768*blockSize,
+		Extent{Block: 0, Len: 32768, StartLo: 100000},
+		Extent{Block: 32768, Len: 32768, StartLo: 200000},
+		Extent{Block: 65536, Len: 32768, StartLo: 300000},
+	)
+	ext4fs := &FileSystem{sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}}
+	f, err := ext4fs.file(FileInfo{name: "test", inode: inode}, "test")
+	if err != nil {
+		t.Fatalf("file(): %v", err)
+	}
+	if len(f.runs) != 3 {
+		t.Errorf("%d runs for 3 extents, want 3", len(f.runs))
+	}
+}
+
+// TestFileOpen_RejectsOverlappingExtents: two extents claiming one logical
+// block is corruption, with no way to tell which holds the data.
+func TestFileOpen_RejectsOverlappingExtents(t *testing.T) {
+	inode := extentInode(t, 8*4096,
+		Extent{Block: 0, Len: 4, StartLo: 10},
+		Extent{Block: 3, Len: 4, StartLo: 20},
+	)
+	ext4fs := &FileSystem{sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}}
+	if _, err := ext4fs.file(FileInfo{name: "test", inode: inode}, "test"); err == nil {
+		t.Fatal("file() accepted overlapping extents")
+	}
+}
+
+// TestFileFromBlock_JoinsContiguousBlocks: a block-mapped file gets one run
+// per contiguous stretch, and reads back across the joins and the hole.
+func TestFileFromBlock_JoinsContiguousBlocks(t *testing.T) {
+	const blockSize = 4096
+	// Blocks 20,21,22 contiguous; a hole; then 9 and 10.
+	inode := buildBlockAddressingInode([12]uint32{20, 21, 22, 0, 9, 10}, 0, 0, 0, 6*blockSize)
+
+	image := make([]byte, 32*blockSize)
+	for i := range image {
+		image[i] = byte(i/blockSize*3 + i%17 + 1)
+	}
+	ext4fs := &FileSystem{
+		r:     io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image))),
+		sb:    Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
+		cache: &mockCache[string, any]{},
+	}
+	f, err := ext4fs.fileFromBlock(FileInfo{name: "test", inode: inode}, "test")
+	if err != nil {
+		t.Fatalf("fileFromBlock(): %v", err)
+	}
+	if len(f.runs) != 2 {
+		t.Errorf("%d runs, want 2: %+v", len(f.runs), f.runs)
+	}
+
+	want := make([]byte, 6*blockSize)
+	copy(want, image[20*blockSize:23*blockSize])
+	copy(want[4*blockSize:], image[9*blockSize:11*blockSize])
+	if got := readAll(t, f); !bytes.Equal(got, want) {
+		t.Error("read data does not match the block map")
+	}
+}
+
+// TestFileRead_TruncatedDeviceIsNotEOF: the extent is valid by the superblock
+// but the device ends partway through it. That has to be an error no caller
+// can take for the end of the file -- not by == and not by errors.Is -- or a
+// cut-short image restores as a shorter file with no error.
+func TestFileRead_TruncatedDeviceIsNotEOF(t *testing.T) {
+	const blockSize = 4096
+	const fileSize = 4 * blockSize
+
+	// The extent starts at block 1 and the device stops 100 bytes into the
+	// file's third block.
+	image := make([]byte, 3*blockSize+100)
+	for i := range image {
+		image[i] = byte(i%251 + 1)
+	}
+	inode := extentInode(t, fileSize, Extent{Block: 0, Len: 4, StartLo: 1})
+
+	for _, bufSize := range []int{blockSize, 1 << 20} {
+		ext4fs := &FileSystem{
+			r:  io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image))),
+			sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
+		}
+		f, err := ext4fs.file(FileInfo{name: "test", inode: inode}, "test")
+		if err != nil {
+			t.Fatalf("file(): %v", err)
+		}
+
+		buf := make([]byte, bufSize)
+		var total int
+		for err == nil {
+			var n int
+			n, err = f.Read(buf)
+			total += n
+		}
+		if total >= fileSize {
+			t.Fatalf("buffer %d: read %d bytes from a device that holds fewer", bufSize, total)
+		}
+		if errors.Is(err, io.EOF) {
+			t.Errorf("buffer %d: truncated device reported as end of file: %v", bufSize, err)
+		}
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("buffer %d: error is not io.ErrUnexpectedEOF: %v", bufSize, err)
+		}
+
+		// A failed Read does not move the position: asking again fails the
+		// same way rather than skipping the missing bytes or ending the file.
+		if n, err := f.Read(buf); n != 0 || err == nil || errors.Is(err, io.EOF) {
+			t.Errorf("buffer %d: Read after the error returned %d, %v", bufSize, n, err)
+		}
+	}
+}
+
+// eofWithDataReaderAt returns io.EOF together with a read that reaches the
+// end of the input, which io.ReaderAt allows.
+type eofWithDataReaderAt struct{ data []byte }
+
+func (r eofWithDataReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	n := copy(p, r.data[off:])
+	if off+int64(n) == int64(len(r.data)) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// TestFileRead_FullReadWithEOFIsNotAnError: a complete read that arrives with
+// io.EOF, because the file ends where the device does, is a successful read.
+func TestFileRead_FullReadWithEOFIsNotAnError(t *testing.T) {
+	const blockSize = 4096
+	image := make([]byte, 3*blockSize)
+	for i := range image {
+		image[i] = byte(i%251 + 1)
+	}
+	inode := extentInode(t, 2*blockSize, Extent{Block: 0, Len: 2, StartLo: 1})
+	ext4fs := &FileSystem{
+		r:  io.NewSectionReader(eofWithDataReaderAt{image}, 0, int64(len(image))),
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
+	}
+	f, err := ext4fs.file(FileInfo{name: "test", inode: inode}, "test")
+	if err != nil {
+		t.Fatalf("file(): %v", err)
+	}
+	got, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, image[blockSize:]) {
+		t.Error("read data does not match the device")
 	}
 }
