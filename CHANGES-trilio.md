@@ -33,6 +33,8 @@ Every section has a plain description first and a fuller one after it.
 | `ext4/acl_test.go`, `ext4/image_test.go`, `ext4/api_test.go` | **new** | unit tests and tests against real ext4 images (§13) |
 | `e2e/`, `scripts/e2e-*.sh` | **new** | end-to-end clone test against a kernel-mounted disk (§13) |
 | `.github/workflows/test.yml` | **new** | CI on pull requests and on pushes to master/main (§13) |
+| `ext4/file.go`, `ext4/fs.go` | modified | file reads: one entry per extent instead of per block, one `ReadAt` per extent, no shared read offset (§14) |
+| `ext4/fs.go` | modified | refuse a superblock with zero blocks or inodes per group (§14, upstream #22) |
 
 Roughly 1,060 lines added across the fork.
 
@@ -592,3 +594,45 @@ so stock filesystems from current distributions were being refused.
 
 Statement coverage of `ext4/` went from 42% to 84%. Both the ACL bug (§11)
 and the block-map symlink panic (§12) fail these tests on the previous code.
+
+---
+
+## 14. Reading file contents
+
+### In plain terms
+
+**Issues.**
+
+- Opening a file built a map with one entry for every 4 KiB block and kept it
+  for the whole read: about 93 MiB of memory for a 10 GiB file, about 6.5 GiB
+  for a 1 TiB file. One large file in a volume could get the datamover pod
+  killed for memory, with no error to explain it.
+- `Read` returned at most one block per call whatever the size of the caller's
+  buffer, and fetched that block from the device 512 bytes at a time: eight
+  device reads and a fresh buffer per 4 KiB.
+- Every read moved the one read offset that all open files share, so two files
+  read at the same time could get each other's blocks. Fixed upstream (#23)
+  for the same reason.
+- A superblock with zero blocks per group or zero inodes per group crashed
+  `NewFS` with a divide by zero (upstream #22).
+
+**Changes.**
+
+- A `File` keeps one entry per run of contiguous blocks: an extent, or a
+  stretch of neighbouring blocks in a block-mapped file. Memory follows the
+  number of extents, not the size of the file. A block no run covers is a
+  hole and reads as zeros, as before; so does an unwritten extent.
+- `Read` fills the caller's buffer up to the end of the current run, hole or
+  file, with a single `ReadAt`. A 1 MiB buffer gets up to 1 MiB per call.
+- `ReadAt` does not use the shared offset, so different files can be read
+  concurrently. One `File` is still for one reader at a time.
+- Extents of one file that overlap are refused when the file is opened, as the
+  kernel does. Before, whichever sorted later silently won.
+- `parseSuperBlock` returns an error for the zero group sizes.
+
+The bytes returned are unchanged. Not changed: opening a block-mapped
+(ext3-style) file still resolves a 4-byte address per block first, about
+256 MiB per TiB, released once the runs are built.
+
+Upstream #21 (symlink resolution) was not taken: §12 already covers it, and
+upstream cleans the link target where this fork returns it verbatim.

@@ -821,24 +821,25 @@ func (ext4 *FileSystem) fileFromBlock(fi FileInfo, filePath string) (*File, erro
 		return nil, xerrors.Errorf("failed to get block addresses: %w", err)
 	}
 
-	dt := make(dataTable)
+	// Join neighbouring blocks into runs. An address of zero is a hole and
+	// gets no run.
+	var runs []blockRun
 	for i, blockAddress := range blockAddresses {
 		if blockAddress == 0 {
 			continue
 		}
-		dt[int64(i)] = int64(blockAddress) * ext4.sb.GetBlockSize()
+		logical, physical := int64(i), int64(blockAddress)
+		if n := len(runs); n > 0 {
+			last := &runs[n-1]
+			if last.logical+last.count == logical && last.physical+last.count == physical {
+				last.count++
+				continue
+			}
+		}
+		runs = append(runs, blockRun{logical: logical, physical: physical, count: 1})
 	}
 
-	return &File{
-		fs:           ext4,
-		FileInfo:     fi,
-		currentBlock: -1,
-		buffer:       bytes.NewBuffer(nil),
-		filePath:     filePath,
-		blockSize:    ext4.sb.GetBlockSize(),
-		table:        dt,
-		size:         fi.Size(),
-	}, nil
+	return ext4.newFile(fi, filePath, runs), nil
 }
 
 func (ext4 *FileSystem) file(fi FileInfo, filePath string) (*File, error) {
@@ -847,29 +848,39 @@ func (ext4 *FileSystem) file(fi FileInfo, filePath string) (*File, error) {
 		return nil, err
 	}
 
-	dt := make(dataTable)
-	for _, e := range extents {
+	// Extents arrives sorted by logical block.
+	runs := make([]blockRun, 0, len(extents))
+	var end int64 // first logical block past the previous extent
+	for i := range extents {
+		e := &extents[i]
+		logical, count := int64(e.Block), int64(e.GetLen())
+		// Two extents claiming the same logical block is corruption, and
+		// there is no telling which of them holds the file's data. The
+		// kernel refuses such an inode too (ext4_valid_extent_entries).
+		if logical < end {
+			return nil, xerrors.Errorf("extent at logical block %d overlaps the previous extent, which ends at %d", logical, end)
+		}
+		end = logical + count
 		// Uninitialized (unwritten) extents should read as zeros;
-		// omitting them from the table delegates to the sparse path in Read().
-		if e.IsUninitialized() {
+		// giving them no run delegates to the sparse path in Read().
+		if e.IsUninitialized() || count == 0 {
 			continue
 		}
-		offset := e.offset() * ext4.sb.GetBlockSize()
-		for i := int64(0); i < int64(e.GetLen()); i++ {
-			dt[int64(e.Block)+i] = offset + i*ext4.sb.GetBlockSize()
-		}
+		runs = append(runs, blockRun{logical: logical, physical: e.offset(), count: count})
 	}
 
+	return ext4.newFile(fi, filePath, runs), nil
+}
+
+func (ext4 *FileSystem) newFile(fi FileInfo, filePath string, runs []blockRun) *File {
 	return &File{
-		fs:           ext4,
-		FileInfo:     fi,
-		currentBlock: -1,
-		buffer:       bytes.NewBuffer(nil),
-		filePath:     filePath,
-		blockSize:    ext4.sb.GetBlockSize(),
-		table:        dt,
-		size:         fi.Size(),
-	}, nil
+		fs:        ext4,
+		FileInfo:  fi,
+		filePath:  filePath,
+		blockSize: ext4.sb.GetBlockSize(),
+		runs:      runs,
+		size:      fi.Size(),
+	}
 }
 
 func (ext4 *FileSystem) wrapError(op, path string, err error) error {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -1108,17 +1109,13 @@ func TestFileFromBlockSkipsZeroAddresses(t *testing.T) {
 		t.Fatalf("fileFromBlock failed: %v", err)
 	}
 
-	// Block 0 (physical 10) should be in table
-	if _, ok := f.table[0]; !ok {
-		t.Error("block 0 should be in data table")
+	// Blocks 0 and 2 each get a run; block 1 (hole) gets none.
+	want := []blockRun{
+		{logical: 0, physical: 10, count: 1},
+		{logical: 2, physical: 12, count: 1},
 	}
-	// Block 1 (hole) should NOT be in table
-	if _, ok := f.table[1]; ok {
-		t.Error("block 1 (hole) should not be in data table")
-	}
-	// Block 2 (physical 12) should be in table
-	if _, ok := f.table[2]; !ok {
-		t.Error("block 2 should be in data table")
+	if !reflect.DeepEqual(f.runs, want) {
+		t.Errorf("runs = %+v, want %+v", f.runs, want)
 	}
 
 	// Read block 0 — should be 0xAA
