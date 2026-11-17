@@ -629,6 +629,10 @@ and the block-map symlink panic (§12) fail these tests on the previous code.
 - Extents of one file that overlap are refused when the file is opened, as the
   kernel does. Before, whichever sorted later silently won.
 - `parseSuperBlock` returns an error for the zero group sizes.
+- A device that ends partway through a file's data returns
+  `io.ErrUnexpectedEOF`. It used to return an error wrapping `io.EOF`, which
+  a caller testing with `errors.Is(err, io.EOF)` would take for a normal end
+  of file and so accept a short file.
 
 The bytes returned are unchanged. Not changed: opening a block-mapped
 (ext3-style) file still resolves a 4-byte address per block first, about

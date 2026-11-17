@@ -216,7 +216,11 @@ func (f *File) Read(p []byte) (int, error) {
 	offset := run.physical*f.blockSize + (f.pos - run.logical*f.blockSize)
 	rn, err := f.fs.r.ReadAt(p, offset)
 	if rn != len(p) {
-		if err == nil {
+		// The device ended inside a run the filesystem says is there. That
+		// is not the end of the file, and must not look like it to a caller
+		// testing with errors.Is(err, io.EOF): the file would be taken as
+		// complete and come out short.
+		if err == nil || errors.Is(err, io.EOF) {
 			err = io.ErrUnexpectedEOF
 		}
 		return 0, xerrors.Errorf("failed to read block: actual(%d), expected(%d): %w", rn, len(p), err)

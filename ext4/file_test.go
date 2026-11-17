@@ -3,6 +3,7 @@ package ext4
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"io/fs"
 	"sync"
@@ -637,5 +638,94 @@ func TestFileFromBlock_JoinsContiguousBlocks(t *testing.T) {
 	copy(want[4*blockSize:], image[9*blockSize:11*blockSize])
 	if got := readAll(t, f); !bytes.Equal(got, want) {
 		t.Error("read data does not match the block map")
+	}
+}
+
+// TestFileRead_TruncatedDeviceIsNotEOF: the extent is valid by the superblock
+// but the device ends partway through it. That has to be an error no caller
+// can take for the end of the file -- not by == and not by errors.Is -- or a
+// cut-short image restores as a shorter file with no error.
+func TestFileRead_TruncatedDeviceIsNotEOF(t *testing.T) {
+	const blockSize = 4096
+	const fileSize = 4 * blockSize
+
+	// The extent starts at block 1 and the device stops 100 bytes into the
+	// file's third block.
+	image := make([]byte, 3*blockSize+100)
+	for i := range image {
+		image[i] = byte(i%251 + 1)
+	}
+	inode := extentInode(t, fileSize, Extent{Block: 0, Len: 4, StartLo: 1})
+
+	for _, bufSize := range []int{blockSize, 1 << 20} {
+		ext4fs := &FileSystem{
+			r:  io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image))),
+			sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
+		}
+		f, err := ext4fs.file(FileInfo{name: "test", inode: inode}, "test")
+		if err != nil {
+			t.Fatalf("file(): %v", err)
+		}
+
+		buf := make([]byte, bufSize)
+		var total int
+		for err == nil {
+			var n int
+			n, err = f.Read(buf)
+			total += n
+		}
+		if total >= fileSize {
+			t.Fatalf("buffer %d: read %d bytes from a device that holds fewer", bufSize, total)
+		}
+		if errors.Is(err, io.EOF) {
+			t.Errorf("buffer %d: truncated device reported as end of file: %v", bufSize, err)
+		}
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("buffer %d: error is not io.ErrUnexpectedEOF: %v", bufSize, err)
+		}
+
+		// A failed Read does not move the position: asking again fails the
+		// same way rather than skipping the missing bytes or ending the file.
+		if n, err := f.Read(buf); n != 0 || err == nil || errors.Is(err, io.EOF) {
+			t.Errorf("buffer %d: Read after the error returned %d, %v", bufSize, n, err)
+		}
+	}
+}
+
+// eofWithDataReaderAt returns io.EOF together with a read that reaches the
+// end of the input, which io.ReaderAt allows.
+type eofWithDataReaderAt struct{ data []byte }
+
+func (r eofWithDataReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	n := copy(p, r.data[off:])
+	if off+int64(n) == int64(len(r.data)) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// TestFileRead_FullReadWithEOFIsNotAnError: a complete read that arrives with
+// io.EOF, because the file ends where the device does, is a successful read.
+func TestFileRead_FullReadWithEOFIsNotAnError(t *testing.T) {
+	const blockSize = 4096
+	image := make([]byte, 3*blockSize)
+	for i := range image {
+		image[i] = byte(i%251 + 1)
+	}
+	inode := extentInode(t, 2*blockSize, Extent{Block: 0, Len: 2, StartLo: 1})
+	ext4fs := &FileSystem{
+		r:  io.NewSectionReader(eofWithDataReaderAt{image}, 0, int64(len(image))),
+		sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount},
+	}
+	f, err := ext4fs.file(FileInfo{name: "test", inode: inode}, "test")
+	if err != nil {
+		t.Fatalf("file(): %v", err)
+	}
+	got, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, image[blockSize:]) {
+		t.Error("read data does not match the device")
 	}
 }
