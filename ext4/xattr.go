@@ -2,6 +2,7 @@ package ext4
 
 import (
 	"encoding/binary"
+	"fmt"
 	"sort"
 
 	"golang.org/x/xerrors"
@@ -146,7 +147,7 @@ func (ext4 *FileSystem) readInlineXattrs(raw []byte, out map[string][]byte) erro
 	// same point the entries begin.
 	region := raw[magicAt+4:]
 	return parseXattrEntries(region, 0, len(region), ext4.sb.FeatureIncompatEaInode(),
-		readEANotSupported, out)
+		ext4.readEAInodeValue, out)
 }
 
 // readBlockXattrs reads attributes stored in a separate block.
@@ -186,7 +187,7 @@ func (ext4 *FileSystem) readBlockXattrs(raw []byte, out map[string][]byte) error
 	// entriesBase is 32 because value offsets are measured from the block
 	// start while entries begin after the header.
 	return parseXattrEntries(block, xattrHeaderSize, int(blockSize)-xattrHeaderSize,
-		ext4.sb.FeatureIncompatEaInode(), readEANotSupported, out)
+		ext4.sb.FeatureIncompatEaInode(), ext4.readEAInodeValue, out)
 }
 
 // entryLen is EXT2_EXT_ATTR_LEN: the on-disk size of one entry, its name
@@ -205,6 +206,109 @@ var errEAInodeNotSupported = xerrors.New("ea_inode is not supported")
 // readEANotSupported is an eaValueReader that refuses every EA inode.
 func readEANotSupported(uint32, int) ([]byte, error) {
 	return nil, errEAInodeNotSupported
+}
+
+// goodOldFirstIno is EXT2_GOOD_OLD_FIRST_INO: the first non-reserved inode
+// on a revision 0 filesystem, whose superblock has no s_first_ino.
+const goodOldFirstIno = 11
+
+// readEAInodeValue returns the size bytes stored in EA inode inum.
+//
+// An EA inode is a regular inode flagged EA_INODE_FL whose i_size is the
+// value's length and whose data blocks hold the value. It is mapped like any
+// file, by extents or by the classic block map. ext4 writes it with no holes
+// (the kernel's ext4_xattr_inode_read refuses one), so a hole, an unwritten
+// extent or a block outside the filesystem is damage and an error.
+//
+// The returned slice is allocated on every call and never shared: several
+// entries may name the same EA inode, and each value handed to a caller must
+// be its own memory.
+func (ext4 *FileSystem) readEAInodeValue(inum uint32, size int) ([]byte, error) {
+	firstIno := uint32(goodOldFirstIno)
+	if ext4.sb.RevLevel > 0 {
+		firstIno = ext4.sb.FirstIno
+	}
+	if inum < firstIno || inum > ext4.sb.InodeCount {
+		return nil, xerrors.Errorf("EA inode %d out of range %d..%d", inum, firstIno, ext4.sb.InodeCount)
+	}
+	if size <= 0 || size > xattrValueMax {
+		return nil, xerrors.Errorf("EA inode %d: value size %d is invalid", inum, size)
+	}
+
+	inode, err := ext4.getInode(int64(inum))
+	if err != nil {
+		return nil, xerrors.Errorf("EA inode %d: %w", inum, err)
+	}
+	if !inode.IsRegular() {
+		return nil, xerrors.Errorf("EA inode %d is not a regular file (mode %#o)", inum, inode.Mode)
+	}
+	if inode.Flags&EA_INODE_FL == 0 {
+		return nil, xerrors.Errorf("inode %d is not an EA inode (EA_INODE_FL not set, flags %#x)", inum, inode.Flags)
+	}
+	if got := inode.GetSize(); got != int64(size) {
+		return nil, xerrors.Errorf("EA inode %d has size %d, entry says %d", inum, got, size)
+	}
+
+	blockSize := ext4.sb.GetBlockSize()
+	nblocks := (int64(size) + blockSize - 1) / blockSize
+	physical, err := ext4.eaInodeBlocks(inode, nblocks)
+	if err != nil {
+		return nil, xerrors.Errorf("EA inode %d: %w", inum, err)
+	}
+
+	value := make([]byte, size)
+	for i, blk := range physical {
+		if blk == 0 {
+			return nil, xerrors.Errorf("EA inode %d: block %d of the value is a hole", inum, i)
+		}
+		if err := ext4.checkPhysicalBlocks(blk, 1, fmt.Sprintf("EA inode %d block %d", inum, i)); err != nil {
+			return nil, err
+		}
+		chunk := value[int64(i)*blockSize:]
+		if int64(len(chunk)) > blockSize {
+			chunk = chunk[:blockSize]
+		}
+		if n, err := ext4.r.ReadAt(chunk, blk*blockSize); n != len(chunk) {
+			return nil, xerrors.Errorf("EA inode %d: short read of block %d (%d of %d bytes): %w",
+				inum, blk, n, len(chunk), err)
+		}
+	}
+	return value, nil
+}
+
+// eaInodeBlocks returns the physical block of each of the first nblocks
+// logical blocks of an EA inode, 0 where nothing is mapped.
+func (ext4 *FileSystem) eaInodeBlocks(inode *Inode, nblocks int64) ([]int64, error) {
+	physical := make([]int64, nblocks)
+	if !inode.UsesExtents() {
+		addrs, err := inode.GetBlockAddresses(ext4)
+		if err != nil {
+			return nil, err
+		}
+		for i := int64(0); i < nblocks && i < int64(len(addrs)); i++ {
+			physical[i] = int64(addrs[i])
+		}
+		return physical, nil
+	}
+
+	extents, err := ext4.Extents(inode)
+	if err != nil {
+		return nil, err
+	}
+	for i := range extents {
+		e := &extents[i]
+		start, count := int64(e.Block), int64(e.GetLen())
+		for j := int64(0); j < count && start+j < nblocks; j++ {
+			if physical[start+j] != 0 {
+				return nil, xerrors.Errorf("logical block %d is mapped twice", start+j)
+			}
+			if e.IsUninitialized() {
+				return nil, xerrors.Errorf("logical block %d is in an unwritten extent", start+j)
+			}
+			physical[start+j] = e.offset() + j
+		}
+	}
+	return physical, nil
 }
 
 // parseXattrEntries walks an entry table and appends what it finds to out.
@@ -260,8 +364,8 @@ func parseXattrEntries(region []byte, entriesBase, storageSize int,
 		switch {
 		case valueInum != 0:
 			// The value lives in a separate inode. Only legal with the
-			// ea_inode feature, which the feature gate rejects -- so this
-			// is an error rather than a silently empty value.
+			// ea_inode feature: without it this is an error rather than a
+			// silently empty value.
 			if !eaInodeFeature {
 				return xerrors.Errorf("xattr %q has value inode %d but ea_inode feature is not set",
 					name, valueInum)

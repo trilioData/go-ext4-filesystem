@@ -461,3 +461,34 @@ func TestParseXattrValueInodeErrors(t *testing.T) {
 			`xattr "user.big" has value inode 12 but ea_inode feature is not set`)
 	})
 }
+
+// readEAInodeValue refuses what cannot be an EA inode before reading
+// anything: a reserved or out-of-range inode number, and a size the parser
+// would have refused. The FileSystem here has a superblock only, so any read
+// would fail with a different error.
+func TestReadEAInodeValueRange(t *testing.T) {
+	cases := []struct {
+		name     string
+		rev      uint32
+		firstIno uint32
+		inum     uint32
+		size     int
+		want     string
+	}{
+		{"inode 0", 1, 11, 0, 100, "EA inode 0 out of range 11..100"},
+		{"below s_first_ino", 1, 20, 19, 100, "EA inode 19 out of range 20..100"},
+		{"revision 0 has no s_first_ino", 0, 50, 10, 100, "EA inode 10 out of range 11..100"},
+		{"past the inode count", 1, 11, 101, 100, "EA inode 101 out of range 11..100"},
+		{"size 0", 1, 11, 12, 0, "EA inode 12: value size 0 is invalid"},
+		{"size over 64 KiB", 1, 11, 12, xattrValueMax + 1, "EA inode 12: value size 65537 is invalid"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fsys := &FileSystem{sb: Superblock{RevLevel: c.rev, FirstIno: c.firstIno, InodeCount: 100}}
+			v, err := fsys.readEAInodeValue(c.inum, c.size)
+			if err == nil || err.Error() != c.want {
+				t.Errorf("readEAInodeValue(%d, %d) = %d bytes, %v; want %q", c.inum, c.size, len(v), err, c.want)
+			}
+		})
+	}
+}
