@@ -794,30 +794,14 @@ func (ext4 *FileSystem) ReadLink(name string) (string, error) {
 }
 
 // isFastSymlink reports whether a symlink's target is stored in the inode
-// itself.
+// itself: the link owns no data blocks other than an xattr block, as in
+// ext4_inode_is_fast_symlink.
 //
-// The first test is the one ext4_inode_is_fast_symlink makes for an
-// ordinary symlink in kernels through 6.16: the link owns no data blocks
-// other than an xattr block.
-//
-// On an ea_inode filesystem that test is not enough. The blocks of the link's
-// EA inodes are charged to its i_blocks (e2fsck requires it and the kernel
-// does it), so a short link that owns an EA inode counts more than an xattr
-// block although its target sits in the inode. There the size decides, as
-// ext2fs_is_fast_symlink in e2fsprogs does: a non-zero size below the 60-byte
-// i_block area is a fast link. No ext4 writer stores so short a target in a
-// block.
-//
-// Kernels 6.18 and later decide by size on ea_inode filesystems too.
-// Kernels through 6.16 test the link's own EA_INODE_FL, which an ordinary
-// symlink never has, so they apply the i_blocks test alone and would take
-// such a link for a slow one (6.17 was not checked). The size rule is right for the data on disk:
-// the kernel and e2fsprogs both choose fast or slow by target length when
-// the link is created and never move the target.
-//
-// The size test is a fallback, not the whole rule: a link whose i_blocks
-// counts nothing but an xattr block is fast whatever its size (an empty
-// target included), and without ea_inode i_blocks alone decides, as before.
+// On an ea_inode filesystem the blocks of a link's EA inodes are charged to
+// its i_blocks, so a short link can count more than an xattr block. There a
+// non-zero size below the 60-byte i_block area also makes a fast link, as in
+// ext2fs_is_fast_symlink. Linux 6.17 and later decide fast symlinks by size
+// on ea_inode filesystems; kernels through 6.16 use the i_blocks rule.
 func (ext4 *FileSystem) isFastSymlink(inode *Inode) bool {
 	blocks := uint64(inode.BlocksHigh)<<32 | uint64(inode.BlocksLo) // 512-byte units
 	var eaBlocks uint64

@@ -445,10 +445,7 @@ func compareTrees(t *testing.T, source, clone string) {
 		// A file that is sparse in the source (less than half allocated) must
 		// stay sparse. Exact block counts differ legitimately: the clone may
 		// sit on a filesystem with another block size, and st_blocks also
-		// counts an external xattr block and, with ea_inode, the blocks of
-		// the file's EA inodes. Only sparse files of 1 MiB and more are
-		// checked; the populate script's files with large xattr values are
-		// a few bytes long and never reach it.
+		// counts an external xattr block.
 		if s.mode&syscall.S_IFMT == syscall.S_IFREG && s.size >= 1<<20 &&
 			s.blocks*512 < s.size/2 && c.blocks*512 >= s.size/2 {
 			report("allocated bytes (file is no longer sparse)", s.blocks*512, c.blocks*512)

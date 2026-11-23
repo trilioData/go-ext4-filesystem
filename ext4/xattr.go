@@ -2,7 +2,6 @@ package ext4
 
 import (
 	"encoding/binary"
-	"fmt"
 	"sort"
 
 	"golang.org/x/xerrors"
@@ -207,10 +206,11 @@ const goodOldFirstIno = 11
 // readEAInodeValue returns the size bytes stored in EA inode inum.
 //
 // An EA inode is a regular inode flagged EA_INODE_FL whose i_size is the
-// value's length and whose data blocks hold the value. It is mapped like any
-// file, by extents or by the classic block map. ext4 writes it with no holes
-// (the kernel's ext4_xattr_inode_read refuses one), so a hole, an unwritten
-// extent or a block outside the filesystem is damage and an error.
+// value's length and whose data blocks hold the value. Only an EA inode
+// mapped by extents is read; one without EXTENTS_FL is refused. ext4 writes
+// it with no holes (the kernel's ext4_xattr_inode_read refuses one), so a
+// hole or an unwritten extent is damage and an error. Extents() has already
+// refused any extent outside the filesystem.
 //
 // The returned slice is allocated on every call and never shared: several
 // entries may name the same EA inode, and each value handed to a caller must
@@ -246,6 +246,9 @@ func (ext4 *FileSystem) readEAInodeValue(inum uint32, size int) ([]byte, error) 
 	if inode.LinksCount == 0 {
 		return nil, xerrors.Errorf("EA inode %d is freed (links count 0)", inum)
 	}
+	if !inode.UsesExtents() {
+		return nil, xerrors.Errorf("EA inode %d does not use extents", inum)
+	}
 	if got := inode.GetSize(); got != int64(size) {
 		return nil, xerrors.Errorf("EA inode %d has size %d, entry says %d", inum, got, size)
 	}
@@ -262,9 +265,6 @@ func (ext4 *FileSystem) readEAInodeValue(inum uint32, size int) ([]byte, error) 
 		if blk == 0 {
 			return nil, xerrors.Errorf("EA inode %d: block %d of the value is a hole", inum, i)
 		}
-		if !ext4.physicalBlocksInside(blk, 1) {
-			return nil, ext4.checkPhysicalBlocks(blk, 1, fmt.Sprintf("EA inode %d block %d", inum, i))
-		}
 		chunk := value[int64(i)*blockSize:]
 		if int64(len(chunk)) > blockSize {
 			chunk = chunk[:blockSize]
@@ -278,20 +278,9 @@ func (ext4 *FileSystem) readEAInodeValue(inum uint32, size int) ([]byte, error) 
 }
 
 // eaInodeBlocks returns the physical block of each of the first nblocks
-// logical blocks of an EA inode, 0 where nothing is mapped.
+// logical blocks of an extent-mapped EA inode, 0 where nothing is mapped.
 func (ext4 *FileSystem) eaInodeBlocks(inode *Inode, nblocks int64) ([]int64, error) {
 	physical := make([]int64, nblocks)
-	if !inode.UsesExtents() {
-		addrs, err := inode.GetBlockAddresses(ext4)
-		if err != nil {
-			return nil, err
-		}
-		for i := int64(0); i < nblocks && i < int64(len(addrs)); i++ {
-			physical[i] = int64(addrs[i])
-		}
-		return physical, nil
-	}
-
 	extents, err := ext4.Extents(inode)
 	if err != nil {
 		return nil, err

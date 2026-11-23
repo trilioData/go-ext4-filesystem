@@ -35,17 +35,13 @@ Every section has a plain description first and a fuller one after it.
 | `.github/workflows/test.yml` | **new** | CI on pull requests and on pushes to master/main (§13) |
 | `ext4/file.go`, `ext4/fs.go` | modified | file reads: one entry per extent instead of per block, one `ReadAt` per extent, no shared read offset (§14) |
 | `ext4/fs.go` | modified | refuse a superblock with zero blocks or inodes per group (§14, upstream #22) |
-| `ext4/xattr.go`, `ext4/features.go`, `ext4/const.go` | modified | accept `ea_inode`; read and validate xattr values stored in EA inodes, refusing a freed one (links count 0) (§15) |
+| `ext4/xattr.go`, `ext4/features.go`, `ext4/const.go` | modified | accept `ea_inode`; read and validate xattr values stored in EA inodes, refusing a freed one (links count 0) or one without extents (§15) |
 | `ext4/fs.go` | modified | fast-symlink test on `ea_inode` filesystems (§15) |
-| `ext4/ext4.go` | modified | `physicalBlocksInside`: the block-range check without building an error, so the EA inode block loop allocates nothing per block on the passing path (§15) |
 | `ext4/xattr_test.go`, `ext4/fs_test.go`, `ext4/image_test.go` | modified | tests for §15: entry parser, EA inode reads, damaged EA inodes, symlinks |
 | `scripts/e2e-*.sh`, `.github/workflows/test.yml` | modified | end-to-end clone with `ea_inode` and large xattr values (§15) |
-| `e2e/clone_test.go` | modified | comment only: the block-count check's comment mentions EA inode blocks; the check is unchanged (§15) |
 
-Roughly 4,400 lines of Go added in `ext4/` across the fork, net of lines
-removed and counted against the upstream base (`fe51f5b`); about 1,260 of
-them are library code and the rest tests. The end-to-end harness (`e2e/`,
-`scripts/`) and CI are not counted.
+Roughly 4,370 lines of Go added in `ext4/` across the fork (net, against
+upstream `fe51f5b`): about 1,230 library and 3,140 tests.
 
 ---
 
@@ -548,9 +544,10 @@ Found by backing up an XFS volume with an ACL and tracing the restore's
 **Changes.**
 
 - A target is in the inode exactly when the link owns no data blocks other
-  than an xattr block (the test `ext4_inode_is_fast_symlink` makes for an
-  ordinary symlink in kernels through 6.16). Otherwise
-  it is read through the extent tree or the block map, whichever the inode
+  than an xattr block (the `i_blocks` rule of `ext4_inode_is_fast_symlink`;
+  kernels through 6.16 use the `i_blocks` rule, and Linux 6.17 and later
+  decide fast symlinks by size on `ea_inode` filesystems). Otherwise it is
+  read through the extent tree or the block map, whichever the inode
   uses. §15 adds a size test on `ea_inode` filesystems.
 - `ReadLink` returns the target verbatim, as `readlink(2)` does.
 - `Open` and `Stat` follow a symlink in the final component relative to the
@@ -681,19 +678,18 @@ so those would have been refused.
   inode must declare a size from 1 byte to 64 KiB. The EA inode must be a
   number from the first non-reserved inode (never below 11, whatever the
   superblock says) to the inode count; a regular file; flagged
-  `EA_INODE_FL` (0x200000); not freed (links count above 0); and exactly
-  as long as the entry says. Its data,
-  found through its extents or its block map, must have no hole and no
-  unwritten extent, and every block must lie inside the filesystem. Anything
-  else is an error naming the attribute and the reason, never a panic and
-  never bytes from elsewhere. The entry's value offset is not used for such
+  `EA_INODE_FL` (0x200000); not freed (links count above 0); mapped by
+  extents; and exactly as long as the entry says. Its data must have no hole
+  and no unwritten extent, and every block must lie inside the filesystem.
+  Anything else is an error naming the attribute and the reason, never a
+  panic and never bytes from elsewhere. The entry's value offset is not used for such
   a value, and the value takes no room in the inode or the xattr block.
 - Without `ea_inode`, an entry pointing at an EA inode is still an error, as
   before.
 - **Symlinks.** A short symlink keeps its target in the inode. The reader
-  decided "short" as kernels through 6.16 do for an ordinary symlink: the
-  link owns no blocks other than an xattr block. On an `ea_inode` filesystem the blocks of a
-  link's EA inodes are counted in its block count, so a short link carrying
+  decided "short" by the `i_blocks` rule, which kernels through 6.16 use:
+  the link owns no blocks other than an xattr block. On an `ea_inode`
+  filesystem the blocks of a link's EA inodes are counted in its block count, so a short link carrying
   a large value looked long and its target was read from the wrong place.
   That test still runs first; when it says "long" and the filesystem has
   `ea_inode`, a target of 1 to 59 bytes is taken as short. Without
@@ -704,31 +700,20 @@ into the entry's hash. The reader does not verify it, as it verifies no
 checksums anywhere. What the checks above do and do not catch:
 
 - Detected: a pointer out of range or to a reserved inode; a pointer to an
-  inode that is not a regular file or lacks `EA_INODE_FL`; a freed EA inode
-  (links count 0, which e2fsprogs reports as `EXT2_ET_EA_INODE_CORRUPTED`
-  and the kernel refuses; a freed inode's blocks may already hold other
-  data); a size that does not match the entry; a hole, an unwritten extent, an extent pointing at
-  physical block 0, or a block outside the filesystem in the value's data.
+  inode that is not a regular file or lacks `EA_INODE_FL`; an EA inode
+  without extents; a freed EA inode (links count 0, which e2fsprogs reports
+  as `EXT2_ET_EA_INODE_CORRUPTED` and the kernel refuses; a freed inode's
+  blocks may already hold other data); a size that does not match the
+  entry; a hole, an unwritten extent, an extent pointing at physical block
+  0, or a block outside the filesystem in the value's data.
 - Not detected: an entry pointing at a different EA inode of the same size
   (the other value's bytes are returned; `TestImageEAInodeShared` builds
   exactly this to model a shared EA inode), and damaged bytes inside the
   value's own blocks. Both would take the stored hash to notice.
 
-Also looked at and not done, both pre-existing behaviour of block-map
-(ext2/ext3-style) reading, left as they are because the product's artifacts
-are always ext4 with extents:
-
-- A block-mapped file or directory with a damaged, huge `i_size` makes
-  `GetBlockAddresses` size its result from `i_size` before reading
-  anything, so it can panic (`makeslice: cap out of range`) or exhaust
-  memory. Not reachable through the EA inode path, which checks the EA
-  inode's size against the entry's (at most 64 KiB) first.
-- Block-map indirect pointers are not range-checked: a damaged indirect
-  pointer, in a file or in a block-mapped EA inode, is read from wherever
-  it points. For an EA inode every data block that comes out is still
-  checked against the filesystem before any byte of it is read, so no
-  byte from outside the filesystem reaches a value; but bytes inside it,
-  taken for a pointer table, can name the wrong blocks.
+An EA inode that does not use extents is refused with an error naming it:
+the product's images are always ext4 with extents, and block-mapped EA
+inodes are not read.
 
 ### In more detail
 
@@ -740,15 +725,12 @@ and its size is not counted against the inline or block budget.
 `readEAInodeValue` is the callback both call sites pass; it makes every check
 listed above and allocates a fresh slice per call. The links-count check
 was added after checking that valid EA inodes have a non-zero count:
-`mke2fs -d` (e2fsprogs 1.46.5) writes 1, on extent-mapped and block-mapped
-images, and the kernel sets 1 and keeps the sharing count in other fields;
-the `ea_inode` end-to-end row reads kernel-written EA inodes through it.
-The reader that refuses every EA inode, used before `ea_inode` was
-supported, now lives in `ext4/xattr_test.go`, the only place still using it.
+`mke2fs -d` (e2fsprogs 1.46.5) writes 1, and the kernel sets 1 and keeps
+the sharing count in other fields; the `ea_inode` end-to-end row reads kernel-written EA inodes through it.
 
-`isFastSymlink` agrees with kernels 6.18 and later; kernels through 6.16
-use the `i_blocks` rule for an ordinary symlink (6.17 was not checked). In
-6.18 `ext4_inode_is_fast_symlink` decides by size alone on an `ea_inode`
+Linux 6.17 and later decide fast symlinks by size on `ea_inode`
+filesystems; kernels through 6.16 use the `i_blocks` rule. In 6.17 and later
+`ext4_inode_is_fast_symlink` decides by size alone on an `ea_inode`
 filesystem (a symlink, size non-zero and below 60) without looking at
 `i_blocks`; the reader's rule gives the same answer for every well-formed
 link with a non-empty target (the `i_blocks` test still runs first, so a
@@ -785,8 +767,9 @@ Tests:
   bytes, two 64 KiB values on one inode, one inode with an inline, a block
   and an EA inode value, an ACL beside a large value (when the source
   directory takes ACLs), on 4 KiB blocks with
-  512-byte inodes, 1 KiB blocks with 256-byte inodes and a block-mapped
-  filesystem; a shared EA inode (patched in with `debugfs`, since
+  512-byte inodes and 1 KiB blocks with 256-byte inodes; the same values on
+  a filesystem without extents, every one refused because its EA inode does
+  not use extents; a shared EA inode (patched in with `debugfs`, since
   `mke2fs -d` never shares one); damaged EA inodes and pointers (out of
   range, reserved inode, directory, flag missing, links count 0, size off
   by one, hole, block outside the filesystem); and symlinks owning EA
@@ -808,9 +791,9 @@ Tests:
   told the feature is present, the populate script fails with a message if
   a large value cannot be set, so the row cannot pass without them. Large
   values go only on regular files and a directory, not on a short symlink:
-  on kernels 6.16 and earlier the reference side (the kernel reading its own
-  symlink after the remount) may itself misread such a link, so the
-  comparison would have no valid reference; the reader's handling of that
+  kernels through 6.16 use the `i_blocks` rule, so on them the reference
+  side (the kernel reading its own symlink after the remount) may itself
+  misread such a link and the comparison would have no valid reference; the reader's handling of that
   shape is covered by `TestImageSymlinkWithEAInode` and the unit rows of
   `TestIsFastSymlinkWithEAInodeBlocks`. Values
   go through `setfattr` in base64: in hex a 64 KiB value is a single

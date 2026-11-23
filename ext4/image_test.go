@@ -1020,10 +1020,8 @@ func eaInodeConfig(t *testing.T, name string) imageConfig {
 }
 
 // eaInodeConfigNames are the geometries the EA inode tests run on: 4 KiB
-// blocks with 512-byte inodes, 1 KiB blocks with 256-byte inodes, and a
-// block-mapped (no extents) filesystem whose EA inodes use the classic
-// block map, indirect block included.
-var eaInodeConfigNames = []string{"skeleton-4k-i512", "ext4-1k-i256", "ext3-1k-blockmap"}
+// blocks with 512-byte inodes and 1 KiB blocks with 256-byte inodes.
+var eaInodeConfigNames = []string{"skeleton-4k-i512", "ext4-1k-i256"}
 
 // shmSourceDir returns an empty directory under /dev/shm. The default temp
 // directory's filesystem may refuse xattr values over about 4 KiB; tmpfs
@@ -1348,15 +1346,11 @@ func TestImageEAInodeCorrupt(t *testing.T) {
 				binary.LittleEndian.PutUint32(b[entryAt+4:], inum)
 				return writePatched(t, b)
 			}
-			extents := strings.Contains(cfg.features, "extent")
-			hole, outside := fmt.Sprintf("sif <%d> block[0] 0", ea), fmt.Sprintf("sif <%d> block[0] 0x7fffffff", ea)
-			if extents {
-				// i_block[0] is the extent header's magic and entry count:
-				// no entries leaves the value a hole. i_block[5] is the
-				// first extent's physical start.
-				hole = fmt.Sprintf("sif <%d> block[0] 0xF30A", ea)
-				outside = fmt.Sprintf("sif <%d> block[5] 0x7fffffff", ea)
-			}
+			// i_block[0] is the extent header's magic and entry count: no
+			// entries leaves the value a hole. i_block[5] is the first
+			// extent's physical start.
+			hole := fmt.Sprintf("sif <%d> block[0] 0xF30A", ea)
+			outside := fmt.Sprintf("sif <%d> block[5] 0x7fffffff", ea)
 			cases := []struct {
 				name, img, want string
 			}{
@@ -1388,6 +1382,40 @@ func TestImageEAInodeCorrupt(t *testing.T) {
 					}
 					t.Logf("%v", err)
 				})
+			}
+		})
+	}
+}
+
+// An EA inode that does not use extents is refused, naming the inode. The
+// images this reader serves are ext4 with extents; a block-mapped EA inode
+// is not read. mke2fs -d on a filesystem without the extent feature writes
+// every EA inode with the classic block map, so every value stored in an EA
+// inode there -- every file of the source tree on 1 KiB blocks -- must fail.
+func TestImageEAInodeWithoutExtents(t *testing.T) {
+	cfg := eaInodeConfig(t, "ext3-1k-blockmap")
+	src := buildEASourceTree(t)
+	img := buildEAImage(t, cfg, src)
+	fsys := openImage(t, img, 0)
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := regexp.MustCompile(`EA inode \d+ does not use extents`)
+	for _, e := range entries {
+		rel := e.Name()
+		t.Run(rel, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			got, err := fsys.ListXattrs(lookupInfo(t, fsys, rel).InodeNumber())
+			if err == nil {
+				t.Fatalf("ListXattrs succeeded with %d values", len(got))
+			}
+			if !refused.MatchString(err.Error()) {
+				t.Errorf("error %q does not say the EA inode does not use extents", err)
 			}
 		})
 	}

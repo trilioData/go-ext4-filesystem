@@ -107,23 +107,10 @@ setfattr -n user.on-dir -v yes xattr
 # passed base64-encoded ("0s"): a 64 KiB value in hex would be one argument
 # longer than the kernel's 128 KiB limit for a single argument.
 #
-# EXT4_E2E_EA_INODE=1 or 0 says whether the filesystem has ea_inode
-# (e2e-clone.sh sets it from the image). Told 1, the script fails rather than
-# go on without the large values. Unset, it is detected from the mount's
-# device, and anything that cannot be detected counts as absent.
-ea_inode=${EXT4_E2E_EA_INODE:-}
-if [ -z "$ea_inode" ]; then
-  ea_inode=0
-  dev=$(findmnt -no SOURCE --target . 2>/dev/null || true)
-  if [ -n "$dev" ] && dumpe2fs -h "$dev" 2>/dev/null | grep '^Filesystem features:.*\bea_inode\b' >/dev/null; then
-    ea_inode=1
-  fi
-fi
-case $ea_inode in
-  0|1) ;;
-  *) echo "EXT4_E2E_EA_INODE must be 0 or 1, not '$ea_inode'" >&2; exit 1 ;;
-esac
-if [ "$ea_inode" = 1 ]; then
+# EXT4_E2E_EA_INODE=1 says the filesystem has ea_inode (e2e-clone.sh sets it
+# from the image); told 1, the script fails rather than go on without the
+# large values. Unset or any other value, no large values are added.
+if [ "${EXT4_E2E_EA_INODE:-}" = 1 ]; then
   b64() { rnd "$1" | base64 -w0; }
   big_fail() { echo "e2e-populate: the filesystem has ea_inode but $*" >&2; exit 1; }
   # setbig <path> <name> <bytes> [base64 value]: set the value (random when
