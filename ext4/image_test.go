@@ -1612,3 +1612,64 @@ func TestImageIndirectPointerOutside(t *testing.T) {
 		}
 	})
 }
+
+// A block-map data block past the end of the filesystem is an error, not
+// the device's slack served as file content: a direct block of a file, and
+// one named by a directory's block map.
+func TestImageBlockMapDataOutside(t *testing.T) {
+	cfg := eaInodeConfig(t, "ext3-1k-blockmap")
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "small"), bytes.Repeat([]byte("data"), 5<<10), 0o644)
+	if err := os.MkdirAll(filepath.Join(src, "dir", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	img := buildImage(t, cfg, src, nil)
+	data, err := os.ReadFile(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := parseSuperBlock(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	past := sb.GetBlockCount()
+	cases := []struct {
+		name, patch string
+		read        func(*FileSystem) error
+	}{
+		{"file direct block", fmt.Sprintf("sif /small block[0] %d", past), func(fsys *FileSystem) error {
+			b, err := openAndRead(fsys, "small")
+			if err == nil {
+				t.Logf("read %d bytes, first %q", len(b), b[:8])
+			}
+			return err
+		}},
+		{"directory block", fmt.Sprintf("sif /dir block[0] %d", past), func(fsys *FileSystem) error {
+			_, err := fsys.ReadDir("dir")
+			return err
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// The slack holds a copy of the image's start: plausible bytes.
+			patched := debugfsPatch(t, img, c.patch)
+			pd, err := os.ReadFile(patched)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fsys := openImage(t, writePatched(t, append(pd, pd[:64<<10]...)), 0)
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			err = c.read(fsys)
+			if err == nil {
+				t.Fatal("succeeded, want an error")
+			}
+			if !strings.Contains(err.Error(), "outside the filesystem") {
+				t.Errorf("error %q does not mention the filesystem bounds", err)
+			}
+		})
+	}
+}

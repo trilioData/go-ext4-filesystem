@@ -3,6 +3,7 @@ package ext4
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 
 	"golang.org/x/xerrors"
 )
@@ -325,6 +326,19 @@ func (i *Inode) GetBlockAddresses(ext4 *FileSystem) ([]uint32, error) {
 		blockAddresses = append(blockAddresses, addrs...)
 	} else if remaining > 0 {
 		blockAddresses = append(blockAddresses, make([]uint32, remaining)...)
+	}
+
+	// Every data block must lie inside the filesystem, as a leaf extent's
+	// must. A corrupt address past the end often still reads (a device has
+	// slack past the filesystem) and those bytes would leave as file or
+	// directory content. Zero is a hole.
+	for j, addr := range blockAddresses {
+		if addr == 0 {
+			continue
+		}
+		if err := ext4.checkPhysicalBlocks(int64(addr), 1, fmt.Sprintf("data block %d", j)); err != nil {
+			return nil, err
+		}
 	}
 
 	return blockAddresses, nil

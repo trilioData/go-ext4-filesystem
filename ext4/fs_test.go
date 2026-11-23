@@ -1584,3 +1584,26 @@ func TestGetBlockAddressesIndirectPointerOutside(t *testing.T) {
 		}
 	})
 }
+
+// A data block address read out of an indirect block must lie inside the
+// filesystem too: the table itself is inside, one of its entries is not.
+func TestGetBlockAddressesDataBlockOutside(t *testing.T) {
+	const blockSize = 1024
+	const fsBlocks = 32
+	image := make([]byte, 64*blockSize)
+	binary.LittleEndian.PutUint32(image[20*blockSize:], 21)   // logical 12: inside
+	binary.LittleEndian.PutUint32(image[20*blockSize+4:], 0)  // logical 13: hole
+	binary.LittleEndian.PutUint32(image[20*blockSize+8:], 40) // logical 14: past the end
+	direct := [12]uint32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	inode := buildBlockAddressingInode(direct, 20, 0, 0, 15*blockSize)
+	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
+	fsys := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 0, FirstDataBlock: 1, BlockCountLo: fsBlocks},
+		cache: &mockCache[string, any]{}}
+	addrs, err := inode.GetBlockAddresses(fsys)
+	if err == nil {
+		t.Fatalf("got addresses %v, want an error", addrs)
+	}
+	if !strings.Contains(err.Error(), "data block 14") || !strings.Contains(err.Error(), "outside the filesystem") {
+		t.Errorf("error %q does not name data block 14 and the filesystem bounds", err)
+	}
+}
