@@ -794,15 +794,36 @@ func (ext4 *FileSystem) ReadLink(name string) (string, error) {
 }
 
 // isFastSymlink reports whether a symlink's target is stored in the inode
-// itself. Same test as ext4_inode_is_fast_symlink in the kernel: the link owns
+// itself.
+//
+// The first test is ext4_inode_is_fast_symlink's in the kernel: the link owns
 // no data blocks other than an xattr block.
+//
+// On an ea_inode filesystem that test is not enough. The blocks of the link's
+// EA inodes are charged to its i_blocks (e2fsck requires it and the kernel
+// does it), so a short link that owns an EA inode counts more than an xattr
+// block although its target sits in the inode. There the size decides, as
+// ext2fs_is_fast_symlink in e2fsprogs does: a non-zero size below the 60-byte
+// i_block area is a fast link. No ext4 writer stores so short a target in a
+// block.
+//
+// The size test is a fallback, not the whole rule: a link whose i_blocks
+// counts nothing but an xattr block is fast whatever its size (an empty
+// target included), and without ea_inode i_blocks alone decides, as before.
 func (ext4 *FileSystem) isFastSymlink(inode *Inode) bool {
 	blocks := uint64(inode.BlocksHigh)<<32 | uint64(inode.BlocksLo) // 512-byte units
 	var eaBlocks uint64
 	if inode.FileACLLo != 0 || inode.FileACLHigh != 0 {
 		eaBlocks = uint64(ext4.sb.GetBlockSize()) / 512
 	}
-	return blocks <= eaBlocks
+	if blocks <= eaBlocks {
+		return true
+	}
+	if !ext4.sb.FeatureIncompatEaInode() {
+		return false
+	}
+	size := inode.GetSize()
+	return size > 0 && size < int64(len(inode.BlockOrExtents))
 }
 
 // Lstat returns the FileInfo of name without following a symlink in the final

@@ -1383,3 +1383,116 @@ func inodeNumber(t *testing.T, img, path string) int {
 	n, _ := strconv.Atoi(m[1])
 	return n
 }
+
+// A short symlink that owns an EA inode is still a fast symlink. The blocks
+// of a link's EA inodes are charged to its i_blocks (e2fsck requires it, the
+// kernel does it, and so does the backup side), so i_blocks counts more than
+// an xattr block although the target sits in the inode. debugfs ea_set gives
+// the links their values (an unprivileged user cannot set trusted.* in the
+// source tree, and user.* is not allowed on a symlink).
+//
+// short-ea-block (xattr block and EA inode) and long-ea are charged by
+// buildImage's e2fsck pass and come out clean. short-ea (EA inode, no xattr
+// block) is given its value and its charge after that pass: e2fsck 1.46.5
+// asks for the charge but, once it is made, takes the link for a slow one
+// (ext2fs_inode_has_valid_blocks2 trusts i_blocks when there is no xattr
+// block) and reports the target bytes as illegal blocks.
+func TestImageSymlinkWithEAInode(t *testing.T) {
+	for _, name := range eaInodeConfigNames {
+		cfg := eaInodeConfig(t, name)
+		t.Run(cfg.name, func(t *testing.T) {
+			requireTools(t, "mke2fs", "debugfs", "e2fsck")
+			rng := rand.New(rand.NewSource(3))
+			src, vals := t.TempDir(), t.TempDir()
+			writeFile(t, filepath.Join(src, "target"), []byte("link target\n"), 0o644)
+			longTarget := strings.Repeat("./", 40) + "target" // 86 bytes: a slow link
+			for link, target := range map[string]string{
+				"short-ea":       "target",
+				"short-ea-block": "target",
+				"long-ea":        longTarget,
+			} {
+				if err := os.Symlink(target, filepath.Join(src, link)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A value as large as a block does not fit in an xattr block
+			// and goes to an EA inode. ea_set -f in e2fsprogs 1.46.5 stores
+			// the first block of the file.
+			big := randBytes(rng, 4096)
+			medium := randBytes(rng, 300)
+			writeFile(t, filepath.Join(vals, "big"), big, 0o644)
+			writeFile(t, filepath.Join(vals, "medium"), medium, 0o644)
+			cmds := []string{
+				"ea_set -f " + filepath.Join(vals, "big") + " /short-ea-block trusted.big",
+				"ea_set -f " + filepath.Join(vals, "big") + " /long-ea trusted.big",
+			}
+			// Enough medium values to spill out of the inode into an
+			// xattr block.
+			for i := 1; i <= 4; i++ {
+				cmds = append(cmds, fmt.Sprintf("ea_set -f %s /short-ea-block trusted.m%d",
+					filepath.Join(vals, "medium"), i))
+			}
+			img := buildImage(t, cfg, src, cmds)
+			// The stored value is one block (see above): one block charged.
+			img = debugfsPatch(t, img,
+				"ea_set -f "+filepath.Join(vals, "big")+" /short-ea trusted.big",
+				fmt.Sprintf("sif /short-ea blocks %d", cfg.blockSize/512))
+			fsys := openImage(t, img, 0)
+
+			for link, target := range map[string]string{
+				"short-ea":       "target",
+				"short-ea-block": "target",
+				"long-ea":        longTarget,
+			} {
+				t.Run(link, func(t *testing.T) {
+					fi := lookupInfo(t, fsys, link)
+					inode := fi.inode
+					blocks := uint64(inode.BlocksHigh)<<32 | uint64(inode.BlocksLo)
+					var xattrBlock uint64
+					if inode.FileACLLo != 0 || inode.FileACLHigh != 0 {
+						xattrBlock = uint64(cfg.blockSize / 512)
+					}
+					t.Logf("size %d, i_blocks %d, xattr block %v", inode.GetSize(), blocks, xattrBlock != 0)
+					// The case under test: i_blocks alone would call a
+					// short link slow.
+					if blocks <= xattrBlock {
+						t.Fatalf("i_blocks %d does not exceed the xattr block (%d): no EA inode blocks charged",
+							blocks, xattrBlock)
+					}
+					if wantBlock := link == "short-ea-block"; (xattrBlock != 0) != wantBlock {
+						t.Fatalf("%s: xattr block present = %v, want %v", link, xattrBlock != 0, wantBlock)
+					}
+
+					got, err := fsys.ReadLink(link)
+					if err != nil || got != target {
+						t.Fatalf("ReadLink = %q, %v; want %q", got, err, target)
+					}
+					f, err := fsys.Open(link)
+					if err != nil {
+						t.Fatalf("Open through the link: %v", err)
+					}
+					defer f.Close()
+					if b, err := io.ReadAll(f); err != nil || string(b) != "link target\n" {
+						t.Errorf("read through the link = %q, %v", b, err)
+					}
+
+					xattrs, err := fsys.ListXattrs(fi.InodeNumber())
+					if err != nil {
+						t.Fatalf("ListXattrs: %v", err)
+					}
+					v := xattrs["trusted.big"]
+					if len(v) != cfg.blockSize || !bytes.Equal(v, big[:len(v)]) {
+						t.Errorf("trusted.big: %d bytes, want the first %d bytes of the value", len(v), cfg.blockSize)
+					}
+					if link == "short-ea-block" {
+						for i := 1; i <= 4; i++ {
+							if m := xattrs[fmt.Sprintf("trusted.m%d", i)]; !bytes.Equal(m, medium) {
+								t.Errorf("trusted.m%d: %d bytes, want the 300-byte value", i, len(m))
+							}
+						}
+					}
+				})
+			}
+		})
+	}
+}
