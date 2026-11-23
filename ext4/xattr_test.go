@@ -517,3 +517,70 @@ func TestReadEAInodeValueFirstInoFloor(t *testing.T) {
 		})
 	}
 }
+
+// eaExtentInode returns an EA inode whose i_block holds a depth-0 extent
+// header and the given extents.
+func eaExtentInode(extents ...Extent) *Inode {
+	inode := &Inode{Mode: FileTypeRegular | 0o600, Flags: EXTENTS_FL | EA_INODE_FL}
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.LittleEndian, &ExtentHeader{Magic: 0xF30A, Entries: uint16(len(extents)), Max: 4})
+	for i := range extents {
+		binary.Write(&buf, binary.LittleEndian, &extents[i])
+	}
+	copy(inode.BlockOrExtents[:], buf.Bytes())
+	return inode
+}
+
+// eaInodeBlocks maps the logical blocks of an extent-mapped EA inode. A
+// logical block claimed by two extents, or lying in an unwritten extent, is
+// damage: there is no telling which bytes are the value.
+func TestEAInodeBlocksExtents(t *testing.T) {
+	const unwritten = extentInitMaxLen // Len above this marks an unwritten extent
+	fsys := &FileSystem{sb: Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}}
+
+	t.Run("adjacent extents", func(t *testing.T) {
+		inode := eaExtentInode(
+			Extent{Block: 0, Len: 2, StartLo: 10},
+			Extent{Block: 2, Len: 1, StartLo: 30},
+			Extent{Block: 5, Len: 1, StartLo: 40}, // past nblocks: not looked at
+		)
+		got, err := fsys.eaInodeBlocks(inode, 3)
+		if err != nil {
+			t.Fatalf("eaInodeBlocks: %v", err)
+		}
+		if want := []int64{10, 11, 30}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+			t.Errorf("eaInodeBlocks = %v, want %v", got, want)
+		}
+	})
+
+	cases := []struct {
+		name    string
+		inode   *Inode
+		nblocks int64
+		want    string
+	}{
+		{"logical block mapped twice", eaExtentInode(
+			Extent{Block: 0, Len: 2, StartLo: 10},
+			Extent{Block: 1, Len: 2, StartLo: 20},
+		), 3, "logical block 1 is mapped twice"},
+		{"same extent twice", eaExtentInode(
+			Extent{Block: 0, Len: 1, StartLo: 10},
+			Extent{Block: 0, Len: 1, StartLo: 10},
+		), 1, "logical block 0 is mapped twice"},
+		{"unwritten extent", eaExtentInode(
+			Extent{Block: 0, Len: 1, StartLo: 10},
+			Extent{Block: 1, Len: unwritten + 1, StartLo: 20},
+		), 2, "logical block 1 is in an unwritten extent"},
+		{"unwritten first extent", eaExtentInode(
+			Extent{Block: 0, Len: unwritten + 2, StartLo: 10},
+		), 2, "logical block 0 is in an unwritten extent"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := fsys.eaInodeBlocks(c.inode, c.nblocks)
+			if err == nil || err.Error() != c.want {
+				t.Errorf("eaInodeBlocks = %v, %v; want %q", got, err, c.want)
+			}
+		})
+	}
+}
