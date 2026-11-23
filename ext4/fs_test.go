@@ -1508,6 +1508,9 @@ func TestIsFastSymlinkWithEAInodeBlocks(t *testing.T) {
 		// 60 bytes and more never fit in i_block: such a target has a block.
 		{"size 60, a data block and an EA inode block", true, symlink(60, 2*xattrBlock, 0), false},
 		{"size 4000, a data block, an xattr block and EA inode blocks", true, symlink(4000, 2*xattrBlock+eaBlocks, 100), false},
+		// An empty target is never a fast link by size: with more than an
+		// xattr block counted it stays slow, as before.
+		{"size 0, xattr block and two EA inode blocks", true, symlink(0, xattrBlock+eaBlocks, 100), false},
 		// Without ea_inode, i_blocks alone decides, as before.
 		{"size 20, xattr block and two more blocks, no ea_inode", false, symlink(20, xattrBlock+eaBlocks, 100), false},
 	}

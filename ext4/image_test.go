@@ -1639,7 +1639,7 @@ func TestImageBlockMapDataOutside(t *testing.T) {
 	}{
 		{"file direct block", fmt.Sprintf("sif /small block[0] %d", past), func(fsys *FileSystem) error {
 			b, err := openAndRead(fsys, "small")
-			if err == nil {
+			if err == nil && len(b) >= 8 {
 				t.Logf("read %d bytes, first %q", len(b), b[:8])
 			}
 			return err
