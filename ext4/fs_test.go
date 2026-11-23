@@ -1454,3 +1454,33 @@ func TestNewFSRejectsZeroGroupSizes(t *testing.T) {
 		})
 	}
 }
+
+// isFastSymlink follows ext4_inode_is_fast_symlink: a symlink is fast when
+// its i_blocks (512-byte units) count no more than the xattr block, if any.
+func TestIsFastSymlink(t *testing.T) {
+	tests := []struct {
+		name         string
+		logBlockSize uint32
+		inode        Inode
+		want         bool
+	}{
+		{"no blocks, no xattr block", 2, Inode{}, true},
+		{"one 4K xattr block", 2, Inode{BlocksLo: 8, FileACLLo: 100}, true},
+		{"one 4K xattr block, high address bits only", 2, Inode{BlocksLo: 8, FileACLHigh: 1}, true},
+		{"one 1K xattr block", 0, Inode{BlocksLo: 2, FileACLLo: 100}, true},
+		{"one data block, no xattr block", 2, Inode{BlocksLo: 8}, false},
+		{"xattr block and a data block", 2, Inode{BlocksLo: 16, FileACLLo: 100}, false},
+		{"1K blocks, a 4K xattr block's worth of sectors", 0, Inode{BlocksLo: 8, FileACLLo: 100}, false},
+		{"blocks counted in the high word", 2, Inode{BlocksHigh: 1, FileACLLo: 100}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fsys := &FileSystem{sb: Superblock{LogBlockSize: tt.logBlockSize, BlockCountLo: testBlockCount}}
+			inode := tt.inode
+			if got := fsys.isFastSymlink(&inode); got != tt.want {
+				t.Errorf("isFastSymlink(blocks=%d/%d, acl=%d/%d) = %v, want %v",
+					inode.BlocksHigh, inode.BlocksLo, inode.FileACLHigh, inode.FileACLLo, got, tt.want)
+			}
+		})
+	}
+}
