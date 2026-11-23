@@ -102,6 +102,30 @@ echo c > xattr/security; setfattr -n security.test -v security-value xattr/secur
 echo r > xattr/readonly; setfattr -n user.tag -v ro xattr/readonly; chmod 0444 xattr/readonly
 setfattr -n user.on-dir -v yes xattr
 
+# Values too large for the xattr block, stored in EA inodes. Only with the
+# ea_inode feature: without it the kernel refuses them (ENOSPC). Values are
+# passed base64-encoded ("0s"): a 64 KiB value in hex would be one argument
+# longer than the kernel's 128 KiB limit for a single argument.
+dev=$(findmnt -no SOURCE --target . 2>/dev/null || true)
+if [ -n "$dev" ] && dumpe2fs -h "$dev" 2>/dev/null | grep '^Filesystem features:.*\bea_inode\b' >/dev/null; then
+  b64() { rnd "$1" | base64 -w0; }
+  echo 8k > xattr/big8k;    setfattr -n user.blob -v "0s$(b64 8192)" xattr/big8k
+  echo 64k > xattr/big64k;  setfattr -n user.blob -v "0s$(b64 65536)" xattr/big64k
+  echo many > xattr/bigmany
+  for i in 1 2 3; do setfattr -n "user.blob$i" -v "0s$(b64 20000)" xattr/bigmany; done
+  # In the inode (with 512-byte inodes), in the xattr block, in an EA inode.
+  echo mixed > xattr/bigmixed
+  setfattr -n user.small -v "0s$(b64 10)" xattr/bigmixed
+  setfattr -n user.medium -v "0s$(b64 3000)" xattr/bigmixed
+  setfattr -n user.large -v "0s$(b64 16384)" xattr/bigmixed
+  # Identical large values: the kernel stores them in one shared EA inode.
+  shared=$(b64 8192)
+  echo a > xattr/shared-a;  setfattr -n user.blob -v "0s$shared" xattr/shared-a
+  echo b > xattr/shared-b;  setfattr -n user.blob -v "0s$shared" xattr/shared-b
+  mkdir xattr/big-dir;      setfattr -n user.blob -v "0s$(b64 8192)" xattr/big-dir
+  echo "ea_inode: added large xattr values"
+fi
+
 # POSIX ACLs: access ACLs with named users and groups, a default ACL on a
 # directory, and a file created under it (inherits).
 mkdir acl

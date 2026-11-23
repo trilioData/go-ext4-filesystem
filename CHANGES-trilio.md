@@ -35,6 +35,11 @@ Every section has a plain description first and a fuller one after it.
 | `.github/workflows/test.yml` | **new** | CI on pull requests and on pushes to master/main (§13) |
 | `ext4/file.go`, `ext4/fs.go` | modified | file reads: one entry per extent instead of per block, one `ReadAt` per extent, no shared read offset (§14) |
 | `ext4/fs.go` | modified | refuse a superblock with zero blocks or inodes per group (§14, upstream #22) |
+| `ext4/xattr.go`, `ext4/features.go`, `ext4/const.go` | modified | accept `ea_inode`; read and validate xattr values stored in EA inodes (§15) |
+| `ext4/fs.go` | modified | fast-symlink test on `ea_inode` filesystems (§15) |
+| `ext4/inode.go` | modified | refuse a block-map indirect or data block outside the filesystem (§7, §15) |
+| `ext4/xattr_test.go`, `ext4/fs_test.go`, `ext4/image_test.go` | modified | tests for §15: entry parser, EA inode reads, damaged EA inodes, symlinks, block maps |
+| `scripts/e2e-*.sh`, `e2e/clone_test.go`, `.github/workflows/test.yml` | modified | end-to-end clone with `ea_inode` and large xattr values (§15) |
 
 Roughly 1,060 lines added across the fork.
 
@@ -114,9 +119,10 @@ features are ignored, which matters because a newer `mke2fs` adds
 `orphan_file` by default and rejecting it would break restores for no reason.
 
 Notable things now refused rather than misread: `encrypt`, `casefold`,
-`inline_data`, `ea_inode`, `meta_bg`, `bigalloc`, and `needs_recovery` — the
-last being a filesystem whose journal holds unreplayed changes, where reading
-without replaying returns stale data.
+`inline_data`, `meta_bg`, `bigalloc`, and `needs_recovery` — the last being a
+filesystem whose journal holds unreplayed changes, where reading without
+replaying returns stale data. `ea_inode` was on this list until §15, which
+reads it.
 
 The allowlist matches the feature set the backup writer pins explicitly, so
 the two sides cannot drift apart silently.
@@ -155,7 +161,8 @@ Attribute names are stored with common prefixes (`user.`, `security.`,
 reassembled. The bounds and consistency checks were ported from the reference
 implementation, including rejecting the case where a value lives in a separate
 inode — a feature the gate in §2 refuses anyway, but which now fails loudly
-rather than returning an empty value.
+rather than returning an empty value. Since §15 such a value is read when the
+filesystem has `ea_inode`; without the feature it is still an error.
 
 ---
 
@@ -308,6 +315,11 @@ filesystem ends. Bounding the region more tightly would not have helped,
 because the gap between the two is exactly where a bad address lands and still
 finds readable bytes. The check has to be on the address, against the
 superblock.
+
+Block-mapped (ext3-style) files were left out of that check until §15:
+an indirect block, or a data block named by the inode or an indirect block,
+past the end of the filesystem was read like any other. Both are now checked
+against the same range before they are used. A zero pointer is still a hole.
 
 This is not a bug that was hit. It needs a damaged or deliberately crafted
 image, and the images this reader is pointed at come from a writer under the
@@ -539,7 +551,7 @@ Found by backing up an XFS volume with an ACL and tracing the restore's
 - A target is in the inode exactly when the link owns no data blocks other
   than an xattr block (the kernel's `ext4_inode_is_fast_symlink`). Otherwise
   it is read through the extent tree or the block map, whichever the inode
-  uses.
+  uses. §15 adds a size test on `ea_inode` filesystems.
 - `ReadLink` returns the target verbatim, as `readlink(2)` does.
 - `Open` and `Stat` follow a symlink in the final component relative to the
   link's own directory, absolute targets from the root, and stop after 40
@@ -571,7 +583,8 @@ unit tests.
   directory, deep paths, 255-byte and non-ASCII names, every symlink shape
   including loops, and large and many xattrs. Further tests cover path forms,
   error values, symlink resolution, `Lstat`, a filesystem at a partition
-  offset, eight unsupported features refused by name, and damaged input
+  offset, six unsupported features refused by name (`ea_inode` is accepted
+  since §15), and damaged input
   returning errors instead of panicking. `-short` skips the large files.
   The e2fsprogs tools are required; without them the tests skip, or fail when
   `EXT4_REQUIRE_TOOLS` is set.
@@ -585,7 +598,8 @@ unit tests.
   pushes to `master` and `main`: gofmt, vet, the unit and image tests with
   `-race` on Ubuntu 22.04 and 24.04 (e2fsprogs 1.46 and 1.47), and the
   end-to-end clone with stock mkfs.ext4 on ubuntu-latest and ubuntu-22.04 plus
-  three pinned geometries on ubuntu-24.04.
+  four pinned geometries on ubuntu-24.04 (the fourth, with `ea_inode`, from
+  §15).
 
 The feature gate now also accepts `metadata_csum_seed`. It only records where
 the checksum seed lives, this reader does not verify checksums, and
@@ -640,3 +654,118 @@ The bytes returned are unchanged. Not changed: opening a block-mapped
 
 Upstream #21 (symlink resolution) was not taken: §12 already covers it, and
 upstream cleans the link target where this fork returns it verbatim.
+
+---
+
+## 15. Extended attribute values stored in EA inodes (`ea_inode`)
+
+### In plain terms
+
+**Issue.** ext4 keeps an extended attribute value in the inode or in one
+xattr block, so a value is limited to about one block (4 KiB on most
+filesystems). With the `ea_inode` feature a larger value, up to 64 KiB, is
+stored in a separate inode of its own (an EA inode) and the attribute entry
+points at it. This reader refused every filesystem with `ea_inode` (§2), so a
+volume whose files carry such values could not be restored at all. The
+skeleton plugin's TK-12867 change enables `ea_inode` on the images it builds,
+so those would have been refused.
+
+**Changes.**
+
+- `ea_inode` is accepted by the feature gate, and `ListXattrs` reads a value
+  stored in an EA inode, whether the attribute entry sits in the inode or in
+  the xattr block. Several entries may point at one EA inode (the kernel
+  shares one between equal large values); each returned value is its own
+  copy.
+- Each value is checked before it is returned. An entry pointing at an EA
+  inode must declare a size from 1 byte to 64 KiB. The EA inode must be a
+  number from the first non-reserved inode (never below 11, whatever the
+  superblock says) to the inode count; a regular file; flagged
+  `EA_INODE_FL` (0x200000); and exactly as long as the entry says. Its data,
+  found through its extents or its block map, must have no hole and no
+  unwritten extent, and every block must lie inside the filesystem. Anything
+  else is an error naming the attribute and the reason, never a panic and
+  never bytes from elsewhere. The entry's value offset is not used for such
+  a value, and the value takes no room in the inode or the xattr block.
+- Without `ea_inode`, an entry pointing at an EA inode is still an error, as
+  before.
+- **Symlinks.** A short symlink keeps its target in the inode. The reader
+  decided "short" as the kernel's older test does: the link owns no blocks
+  other than an xattr block. On an `ea_inode` filesystem the blocks of a
+  link's EA inodes are counted in its block count, so a short link carrying
+  a large value looked long and its target was read from the wrong place.
+  That test still runs first; when it says "long" and the filesystem has
+  `ea_inode`, a target of 1 to 59 bytes is taken as short. Without
+  `ea_inode` nothing changes.
+- **Block maps.** Reading an EA inode through a block map exposed a gap in
+  the shared block-map code: an indirect block or a data block past the end
+  of the filesystem was read like any other. Both are now refused (§7). A
+  damaged block map now fails the whole file read instead of returning bytes
+  from outside the filesystem. A zero pointer is still a hole.
+
+**Not done.** ext4 keeps a hash of the value in the EA inode and folds it
+into the entry's hash. The reader does not verify it: it verifies no
+checksums anywhere, and the inode checks above already catch an entry
+pointing at the wrong inode.
+
+### In more detail
+
+`parseXattrEntries` takes an `eaValueReader` callback and calls it for an
+entry with a non-zero `e_value_inum`, after checking the feature and the
+size (0 and over 64 KiB refused, on the raw 32-bit field). A reader result
+of the wrong length is refused. `e_value_offs` is not read for such an entry
+and its size is not counted against the inline or block budget.
+`readEAInodeValue` is the callback both call sites pass; it makes every check
+listed above and allocates a fresh slice per call.
+
+`isFastSymlink` agrees with the kernel. Linux (current master)
+`ext4_inode_is_fast_symlink` decides by size alone on an `ea_inode`
+filesystem (a symlink, size non-zero and below 60) without looking at
+`i_blocks`; the reader's rule gives the same answer for every non-empty
+target. An empty target is fast only when `i_blocks` counts at most an xattr
+block, as before. e2fsprogs master (`ext2fs_inode_has_valid_blocks2`) falls
+through to the size test when `i_blocks` is non-zero.
+
+e2fsck 1.46.5 does not. For a short symlink that owns an EA inode and has no
+xattr block, once the EA blocks are charged to it, e2fsck 1.46.5 reports
+"illegal block(s)": it takes the target bytes for block numbers. That is a
+false positive of the old e2fsck, not damage; it is recorded here so nobody
+chases it. `TestImageSymlinkWithEAInode` builds that case after its e2fsck
+pass for this reason.
+
+Tests:
+
+- Unit tests (`ext4/xattr_test.go`) on hand-built entry tables for the
+  parser's EA inode branch: missing feature, size 0, over 64 KiB, reader
+  error, wrong length, and that the value takes no storage; for
+  `readEAInodeValue`'s inode number range and its floor of 11; and for the
+  extent error branches of the EA inode's block lookup (a block mapped twice,
+  an unwritten extent). `ext4/fs_test.go` pins `isFastSymlink` with and
+  without `ea_inode`, and the block-map bounds checks on hand-built indirect
+  blocks.
+- Image tests (`ext4/image_test.go`): values of 4040, 4041, 8192 and 65536
+  bytes, two 64 KiB values on one inode, one inode with an inline, a block
+  and an EA inode value, an ACL beside a large value (when the source
+  directory takes ACLs), on 4 KiB blocks with
+  512-byte inodes, 1 KiB blocks with 256-byte inodes and a block-mapped
+  filesystem; a shared EA inode (patched in with `debugfs`, since
+  `mke2fs -d` never shares one); damaged EA inodes and pointers (out of
+  range, reserved inode, directory, flag missing, size off by one, hole,
+  block outside the filesystem); symlinks owning EA inodes; and block maps
+  pointing past the filesystem.
+- End-to-end clone: a new CI row, `skeleton layout with ea_inode`
+  (`-I 512 -O ^has_journal,^orphan_file,ea_inode`, ubuntu-24.04). With
+  `ea_inode`, `scripts/e2e-populate.sh` adds files with an 8 KiB, a 64 KiB,
+  three 20,000-byte, and a 10/3,000/16,384-byte set of values, two files
+  with the same 8 KiB value (one shared EA inode), and a directory with an
+  8 KiB value. Values go through `setfattr` in base64: in hex a 64 KiB value
+  is a single argument over the kernel's 128 KiB limit. Without `ea_inode`
+  the script does what it did before. `scripts/e2e-clone.sh` then clones
+  onto a second ext4 formatted the same way, because an ext4 without
+  `ea_inode` (as `/tmp` may be) refuses values over about one block with
+  `ENOSPC`. The clone comparison's block-count check covers only large
+  sparse files, so EA inode blocks counted in a file's `st_blocks` cannot
+  fail it.
+
+The end-to-end clone with `ea_inode` was not run on the machine this was
+written on (no root); CI runs it.
