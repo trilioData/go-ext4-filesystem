@@ -1496,3 +1496,119 @@ func TestImageSymlinkWithEAInode(t *testing.T) {
 		})
 	}
 }
+
+// withSlack returns a copy of the image at img with n bytes appended, every
+// 32-bit word of them holding ptr. A device usually extends past the
+// filesystem (partition slack, the rest of a disk), so an address past the
+// last block often reads successfully. Filled with a valid block number, the
+// slack also reads as a plausible pointer table.
+func withSlack(t *testing.T, img string, n int, ptr uint32) string {
+	t.Helper()
+	data, err := os.ReadFile(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slack := make([]byte, n)
+	for i := 0; i+4 <= n; i += 4 {
+		binary.LittleEndian.PutUint32(slack[i:], ptr)
+	}
+	return writePatched(t, append(data, slack...))
+}
+
+// openAndRead opens p and reads it to the end; the error is from either step.
+func openAndRead(fsys *FileSystem, p string) ([]byte, error) {
+	f, err := fsys.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+// An indirect block pointer past the end of the filesystem is an error, for
+// a file and for an EA inode, even when the device has readable bytes there:
+// those bytes are not a pointer table of this filesystem.
+func TestImageIndirectPointerOutside(t *testing.T) {
+	cfg := eaInodeConfig(t, "ext3-1k-blockmap")
+	t.Run("file", func(t *testing.T) {
+		src := t.TempDir()
+		rng := rand.New(rand.NewSource(4))
+		small := randBytes(rng, 20<<10) // 12 direct + 8 through the single indirect block
+		big := randBytes(rng, 300<<10)  // reaches the double indirect block
+		writeFile(t, filepath.Join(src, "small"), small, 0o644)
+		writeFile(t, filepath.Join(src, "big"), big, 0o644)
+		img := buildImage(t, cfg, src, nil)
+		data, err := os.ReadFile(img)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sb, err := parseSuperBlock(bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		past := sb.GetBlockCount() // first block past the filesystem
+
+		// Unpatched, both read back whole.
+		fsys := openImage(t, img, 0)
+		for p, want := range map[string][]byte{"small": small, "big": big} {
+			if got, err := openAndRead(fsys, p); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("%s unpatched: %d bytes, %v", p, len(got), err)
+			}
+		}
+
+		cases := []struct{ name, path, field string }{
+			{"single indirect", "small", "block[IND]"},
+			{"single indirect of a larger file", "big", "block[IND]"},
+			{"double indirect", "big", "block[DIND]"},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				patched := debugfsPatch(t, img, fmt.Sprintf("sif /%s %s %d", c.path, c.field, past))
+				fsys := openImage(t, withSlack(t, patched, 64<<10, sb.FirstDataBlock+1), 0)
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("panic: %v", r)
+					}
+				}()
+				got, err := openAndRead(fsys, c.path)
+				if err == nil {
+					t.Fatalf("read %d bytes, want an error", len(got))
+				}
+				if !strings.Contains(err.Error(), "outside the filesystem") {
+					t.Errorf("error %q does not mention the filesystem bounds", err)
+				}
+			})
+		}
+	})
+	t.Run("EA inode", func(t *testing.T) {
+		src := buildEASourceTree(t)
+		img := buildEAImage(t, cfg, src)
+		data, err := os.ReadFile(img)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 64 KiB on 1 KiB blocks: the single indirect block maps most of it.
+		_, ea := eaEntry(t, img, data, cfg, "/v65536", 1, "v")
+		if ea == 0 {
+			t.Fatal("v65536 value is not in an EA inode")
+		}
+		sb, err := parseSuperBlock(bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		patched := debugfsPatch(t, img, fmt.Sprintf("sif <%d> block[IND] %d", ea, sb.GetBlockCount()))
+		fsys := openImage(t, withSlack(t, patched, 64<<10, sb.FirstDataBlock+1), 0)
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panic: %v", r)
+			}
+		}()
+		got, err := fsys.ListXattrs(lookupInfo(t, fsys, "v65536").InodeNumber())
+		if err == nil {
+			t.Fatalf("ListXattrs succeeded with %d values", len(got))
+		}
+		if !strings.Contains(err.Error(), "outside the filesystem") {
+			t.Errorf("error %q does not mention the filesystem bounds", err)
+		}
+	})
+}

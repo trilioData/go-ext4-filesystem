@@ -1526,3 +1526,61 @@ func TestIsFastSymlinkWithEAInodeBlocks(t *testing.T) {
 		})
 	}
 }
+
+// An indirect block pointer past the end of the filesystem is refused before
+// anything is read from it, at every level, although the device holds
+// readable bytes there. A zero pointer is still a hole.
+func TestGetBlockAddressesIndirectPointerOutside(t *testing.T) {
+	const blockSize = 1024
+	const fsBlocks = 32     // the filesystem's own blocks
+	const deviceBlocks = 64 // the device is larger: slack past the filesystem
+	const perBlock = blockSize / 4
+	direct := [12]uint32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	single := int64(12 + perBlock)       // blocks reachable without the double indirect block
+	double := single + perBlock*perBlock // ... without the triple indirect block
+	tests := []struct {
+		name            string
+		ind, dind, tind uint32
+		blocks          int64
+	}{
+		{"single indirect", fsBlocks, 0, 0, 13},
+		{"single indirect, far out", 0xffffffff, 0, 0, 13},
+		{"double indirect", 0, fsBlocks, 0, single + 1},
+		{"triple indirect", 0, 0, fsBlocks + 5, double + 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			image := make([]byte, deviceBlocks*blockSize)
+			inode := buildBlockAddressingInode(direct, tt.ind, tt.dind, tt.tind, tt.blocks*blockSize)
+			sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
+			fsys := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 0, FirstDataBlock: 1, BlockCountLo: fsBlocks},
+				cache: &mockCache[string, any]{}}
+			addrs, err := inode.GetBlockAddresses(fsys)
+			if err == nil {
+				t.Fatalf("got %d addresses, want an error", len(addrs))
+			}
+			if !strings.Contains(err.Error(), "outside the filesystem") {
+				t.Errorf("error %q does not mention the filesystem bounds", err)
+			}
+		})
+	}
+	t.Run("zero pointers are holes", func(t *testing.T) {
+		image := make([]byte, deviceBlocks*blockSize)
+		inode := buildBlockAddressingInode(direct, 0, 0, 0, (double+1)*blockSize)
+		sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
+		fsys := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 0, FirstDataBlock: 1, BlockCountLo: fsBlocks},
+			cache: &mockCache[string, any]{}}
+		addrs, err := inode.GetBlockAddresses(fsys)
+		if err != nil {
+			t.Fatalf("GetBlockAddresses: %v", err)
+		}
+		if int64(len(addrs)) != double+1 {
+			t.Fatalf("got %d addresses, want %d", len(addrs), double+1)
+		}
+		for i := 12; i < len(addrs); i++ {
+			if addrs[i] != 0 {
+				t.Fatalf("addrs[%d] = %d, want 0 (hole)", i, addrs[i])
+			}
+		}
+	})
+}

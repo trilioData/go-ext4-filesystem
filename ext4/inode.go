@@ -153,7 +153,15 @@ func (i *Inode) GetSize() int64 {
 // readIndirectBlockPointers reads all block pointers from an indirect block
 // using ReadAt. Returns up to entriesPerBlock (blockSize/4) entries including
 // zeros (sparse holes).
+//
+// blockAddr is never zero here: callers turn a zero pointer into holes. Any
+// other address must lie inside the filesystem. A corrupt one past the end
+// often still reads (a device has slack past the filesystem), and the bytes
+// found there would be taken for block addresses, then served as file data.
 func readIndirectBlockPointers(ext4 *FileSystem, blockAddr uint32, remaining int64) ([]uint32, error) {
+	if err := ext4.checkPhysicalBlocks(int64(blockAddr), 1, "indirect block"); err != nil {
+		return nil, err
+	}
 	blockSize := ext4.sb.GetBlockSize()
 	buf := make([]byte, blockSize)
 	_, err := ext4.r.ReadAt(buf, int64(blockAddr)*blockSize)
