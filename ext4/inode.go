@@ -3,7 +3,6 @@ package ext4
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 
 	"golang.org/x/xerrors"
 )
@@ -154,15 +153,7 @@ func (i *Inode) GetSize() int64 {
 // readIndirectBlockPointers reads all block pointers from an indirect block
 // using ReadAt. Returns up to entriesPerBlock (blockSize/4) entries including
 // zeros (sparse holes).
-//
-// blockAddr is never zero here: callers turn a zero pointer into holes. Any
-// other address must lie inside the filesystem. A corrupt one past the end
-// often still reads (a device has slack past the filesystem), and the bytes
-// found there would be taken for block addresses, then served as file data.
 func readIndirectBlockPointers(ext4 *FileSystem, blockAddr uint32, remaining int64) ([]uint32, error) {
-	if err := ext4.checkPhysicalBlocks(int64(blockAddr), 1, "indirect block"); err != nil {
-		return nil, err
-	}
 	blockSize := ext4.sb.GetBlockSize()
 	buf := make([]byte, blockSize)
 	_, err := ext4.r.ReadAt(buf, int64(blockAddr)*blockSize)
@@ -326,19 +317,6 @@ func (i *Inode) GetBlockAddresses(ext4 *FileSystem) ([]uint32, error) {
 		blockAddresses = append(blockAddresses, addrs...)
 	} else if remaining > 0 {
 		blockAddresses = append(blockAddresses, make([]uint32, remaining)...)
-	}
-
-	// Every data block must lie inside the filesystem, as a leaf extent's
-	// must. A corrupt address past the end often still reads (a device has
-	// slack past the filesystem) and those bytes would leave as file or
-	// directory content. Zero is a hole.
-	for j, addr := range blockAddresses {
-		if addr == 0 {
-			continue
-		}
-		if !ext4.physicalBlocksInside(int64(addr), 1) {
-			return nil, ext4.checkPhysicalBlocks(int64(addr), 1, fmt.Sprintf("data block %d", j))
-		}
 	}
 
 	return blockAddresses, nil

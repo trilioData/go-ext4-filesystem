@@ -37,13 +37,13 @@ Every section has a plain description first and a fuller one after it.
 | `ext4/fs.go` | modified | refuse a superblock with zero blocks or inodes per group (§14, upstream #22) |
 | `ext4/xattr.go`, `ext4/features.go`, `ext4/const.go` | modified | accept `ea_inode`; read and validate xattr values stored in EA inodes, refusing a freed one (links count 0) (§15) |
 | `ext4/fs.go` | modified | fast-symlink test on `ea_inode` filesystems (§15) |
-| `ext4/inode.go`, `ext4/ext4.go` | modified | refuse a block-map indirect or data block outside the filesystem, with no allocation per block on the passing path (§7, §15) |
-| `ext4/xattr_test.go`, `ext4/fs_test.go`, `ext4/image_test.go` | modified | tests for §15: entry parser, EA inode reads, damaged EA inodes, symlinks, block maps |
+| `ext4/ext4.go` | modified | `physicalBlocksInside`: the block-range check without building an error, so the EA inode block loop allocates nothing per block on the passing path (§15) |
+| `ext4/xattr_test.go`, `ext4/fs_test.go`, `ext4/image_test.go` | modified | tests for §15: entry parser, EA inode reads, damaged EA inodes, symlinks |
 | `scripts/e2e-*.sh`, `.github/workflows/test.yml` | modified | end-to-end clone with `ea_inode` and large xattr values (§15) |
 | `e2e/clone_test.go` | modified | comment only: the block-count check's comment mentions EA inode blocks; the check is unchanged (§15) |
 
-Roughly 4,700 lines of Go added in `ext4/` across the fork, net of lines
-removed and counted against the upstream base (`fe51f5b`); about 1,280 of
+Roughly 4,400 lines of Go added in `ext4/` across the fork, net of lines
+removed and counted against the upstream base (`fe51f5b`); about 1,260 of
 them are library code and the rest tests. The end-to-end harness (`e2e/`,
 `scripts/`) and CI are not counted.
 
@@ -319,11 +319,6 @@ filesystem ends. Bounding the region more tightly would not have helped,
 because the gap between the two is exactly where a bad address lands and still
 finds readable bytes. The check has to be on the address, against the
 superblock.
-
-Block-mapped (ext3-style) files were left out of that check until §15:
-an indirect block, or a data block named by the inode or an indirect block,
-past the end of the filesystem was read like any other. Both are now checked
-against the same range before they are used. A zero pointer is still a hole.
 
 This is not a bug that was hit. It needs a damaged or deliberately crafted
 image, and the images this reader is pointed at come from a writer under the
@@ -703,13 +698,6 @@ so those would have been refused.
   That test still runs first; when it says "long" and the filesystem has
   `ea_inode`, a target of 1 to 59 bytes is taken as short. Without
   `ea_inode` nothing changes.
-- **Block maps.** Reading an EA inode through a block map exposed a gap in
-  the shared block-map code: an indirect block or a data block past the end
-  of the filesystem was read like any other. Both are now refused (§7). A
-  damaged block map now fails the whole file read instead of returning bytes
-  from outside the filesystem. A zero pointer is still a hole. The check
-  builds its error text only when it fails, so it costs no allocation per
-  block on the many block-mapped reads that pass it.
 
 **Not done.** ext4 keeps a hash of the value in the EA inode and folds it
 into the entry's hash. The reader does not verify it, as it verifies no
@@ -726,13 +714,21 @@ checksums anywhere. What the checks above do and do not catch:
   exactly this to model a shared EA inode), and damaged bytes inside the
   value's own blocks. Both would take the stored hash to notice.
 
-Also looked at and not done: a block-mapped (ext2/ext3-style) file or
-directory with a damaged, huge `i_size` makes `GetBlockAddresses` size its
-result from `i_size` before reading anything, so it can panic (`makeslice:
-cap out of range`) or exhaust memory. This predates the fork's changes. It
-is not fixed here because the product's artifacts are always ext4 with
-extents. It is not reachable through the EA inode path, which checks the EA
-inode's size against the entry's (at most 64 KiB) before reading its blocks.
+Also looked at and not done, both pre-existing behaviour of block-map
+(ext2/ext3-style) reading, left as they are because the product's artifacts
+are always ext4 with extents:
+
+- A block-mapped file or directory with a damaged, huge `i_size` makes
+  `GetBlockAddresses` size its result from `i_size` before reading
+  anything, so it can panic (`makeslice: cap out of range`) or exhaust
+  memory. Not reachable through the EA inode path, which checks the EA
+  inode's size against the entry's (at most 64 KiB) first.
+- Block-map indirect pointers are not range-checked: a damaged indirect
+  pointer, in a file or in a block-mapped EA inode, is read from wherever
+  it points. For an EA inode every data block that comes out is still
+  checked against the filesystem before any byte of it is read, so no
+  byte from outside the filesystem reaches a value; but bytes inside it,
+  taken for a pointer table, can name the wrong blocks.
 
 ### In more detail
 
@@ -784,11 +780,7 @@ Tests:
   an unwritten extent, an extent at physical block 0). `ext4/fs_test.go`
   pins `isFastSymlink` with and without `ea_inode` (on `ea_inode`, links
   whose `i_blocks` counts at most an xattr block stay fast at sizes 0, 60
-  and 4000, which the size test alone would call slow), and the block-map bounds
-  checks on hand-built indirect blocks: both rejection (past the end) and
-  acceptance (the last block, count-1, and block 1 where the first data
-  block is 1), and that a mapped block allocates no more than a hole
-  (`testing.AllocsPerRun`).
+  and 4000, which the size test alone would call slow).
 - Image tests (`ext4/image_test.go`): values of 4040, 4041, 8192 and 65536
   bytes, two 64 KiB values on one inode, one inode with an inline, a block
   and an EA inode value, an ACL beside a large value (when the source
@@ -797,9 +789,8 @@ Tests:
   filesystem; a shared EA inode (patched in with `debugfs`, since
   `mke2fs -d` never shares one); damaged EA inodes and pointers (out of
   range, reserved inode, directory, flag missing, links count 0, size off
-  by one, hole, block outside the filesystem); symlinks owning EA inodes;
-  and block maps pointing past the filesystem. The source tree for the
-  large values is
+  by one, hole, block outside the filesystem); and symlinks owning EA
+  inodes. The source tree for the large values is
   built under `/dev/shm`, because the default temp directory may refuse
   values over about one block; tmpfs takes 64 KiB `user.*` values from
   Linux 6.6. Without that, or without an `ea_inode`-capable `mke2fs`, these
