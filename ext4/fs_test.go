@@ -1610,3 +1610,56 @@ func TestGetBlockAddressesDataBlockOutside(t *testing.T) {
 		t.Errorf("error %q does not name data block 14 and the filesystem bounds", err)
 	}
 }
+
+// The accept side of the bounds check: the last block of the filesystem
+// (count-1) is inside, and so is block 1 on a filesystem whose first data
+// block is 1 (1 KiB blocks), as a direct address, as an indirect pointer
+// and as an entry read out of the indirect block.
+func TestGetBlockAddressesBoundsAccepted(t *testing.T) {
+	const blockSize = 1024
+	const fsBlocks = 32
+	const last = fsBlocks - 1
+	image := make([]byte, fsBlocks*blockSize)
+	binary.LittleEndian.PutUint32(image[last*blockSize:], last) // logical 12
+	binary.LittleEndian.PutUint32(image[last*blockSize+4:], 1)  // logical 13
+	direct := [12]uint32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, last}
+	inode := buildBlockAddressingInode(direct, last, 0, 0, 14*blockSize)
+	sr := io.NewSectionReader(bytes.NewReader(image), 0, int64(len(image)))
+	fsys := &FileSystem{r: sr, sb: Superblock{LogBlockSize: 0, FirstDataBlock: 1, BlockCountLo: fsBlocks},
+		cache: &mockCache[string, any]{}}
+	addrs, err := inode.GetBlockAddresses(fsys)
+	if err != nil {
+		t.Fatalf("GetBlockAddresses: %v", err)
+	}
+	want := []uint32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, last, last, 1}
+	if len(addrs) != len(want) {
+		t.Fatalf("got %d addresses %v, want %v", len(addrs), addrs, want)
+	}
+	for i := range want {
+		if addrs[i] != want[i] {
+			t.Fatalf("addrs = %v, want %v", addrs, want)
+		}
+	}
+}
+
+// The bounds check on block-map data addresses costs no allocation per
+// block: a file of twelve mapped blocks allocates no more than a file of
+// twelve holes. Building the error text up front would add one per block
+// to every block-mapped read and directory listing.
+func TestGetBlockAddressesBoundsCheckAllocs(t *testing.T) {
+	const blockSize = 1024
+	fsys := &FileSystem{sb: Superblock{LogBlockSize: 0, FirstDataBlock: 1, BlockCountLo: 64},
+		cache: &mockCache[string, any]{}}
+	mapped := buildBlockAddressingInode([12]uint32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, 0, 0, 0, 12*blockSize)
+	holes := buildBlockAddressingInode([12]uint32{}, 0, 0, 0, 12*blockSize)
+	allocs := func(inode *Inode) float64 {
+		return testing.AllocsPerRun(100, func() {
+			if _, err := inode.GetBlockAddresses(fsys); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	if m, h := allocs(mapped), allocs(holes); m > h {
+		t.Errorf("12 mapped blocks: %.0f allocations, 12 holes: %.0f; the bounds check allocates per block", m, h)
+	}
+}

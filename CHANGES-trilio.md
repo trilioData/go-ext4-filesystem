@@ -37,7 +37,7 @@ Every section has a plain description first and a fuller one after it.
 | `ext4/fs.go` | modified | refuse a superblock with zero blocks or inodes per group (§14, upstream #22) |
 | `ext4/xattr.go`, `ext4/features.go`, `ext4/const.go` | modified | accept `ea_inode`; read and validate xattr values stored in EA inodes (§15) |
 | `ext4/fs.go` | modified | fast-symlink test on `ea_inode` filesystems (§15) |
-| `ext4/inode.go` | modified | refuse a block-map indirect or data block outside the filesystem (§7, §15) |
+| `ext4/inode.go`, `ext4/ext4.go` | modified | refuse a block-map indirect or data block outside the filesystem, with no allocation per block on the passing path (§7, §15) |
 | `ext4/xattr_test.go`, `ext4/fs_test.go`, `ext4/image_test.go` | modified | tests for §15: entry parser, EA inode reads, damaged EA inodes, symlinks, block maps |
 | `scripts/e2e-*.sh`, `.github/workflows/test.yml` | modified | end-to-end clone with `ea_inode` and large xattr values (§15) |
 | `e2e/clone_test.go` | modified | comment only: the block-count check's comment mentions EA inode blocks; the check is unchanged (§15) |
@@ -705,12 +705,22 @@ so those would have been refused.
   the shared block-map code: an indirect block or a data block past the end
   of the filesystem was read like any other. Both are now refused (§7). A
   damaged block map now fails the whole file read instead of returning bytes
-  from outside the filesystem. A zero pointer is still a hole.
+  from outside the filesystem. A zero pointer is still a hole. The check
+  builds its error text only when it fails, so it costs no allocation per
+  block on the many block-mapped reads that pass it.
 
 **Not done.** ext4 keeps a hash of the value in the EA inode and folds it
-into the entry's hash. The reader does not verify it: it verifies no
-checksums anywhere, and the inode checks above already catch an entry
-pointing at the wrong inode.
+into the entry's hash. The reader does not verify it, as it verifies no
+checksums anywhere. What the checks above do and do not catch:
+
+- Detected: a pointer out of range or to a reserved inode; a pointer to an
+  inode that is not a regular file or lacks `EA_INODE_FL`; a size that does
+  not match the entry; a hole, an unwritten extent, an extent pointing at
+  physical block 0, or a block outside the filesystem in the value's data.
+- Not detected: an entry pointing at a different EA inode of the same size
+  (the other value's bytes are returned; `TestImageEAInodeShared` builds
+  exactly this to model a shared EA inode), and damaged bytes inside the
+  value's own blocks. Both would take the stored hash to notice.
 
 ### In more detail
 
@@ -728,8 +738,9 @@ filesystem (a symlink, size non-zero and below 60) without looking at
 `i_blocks`; the reader's rule gives the same answer for every well-formed
 link with a non-empty target (the `i_blocks` test still runs first, so a
 damaged link can differ). An empty target is fast only when `i_blocks`
-counts at most an xattr block, as before. e2fsprogs master (`ext2fs_inode_has_valid_blocks2`) falls
-through to the size test when `i_blocks` is non-zero.
+counts at most an xattr block, as before. e2fsprogs master
+(`ext2fs_inode_has_valid_blocks2`) falls through to the size test when
+`i_blocks` is non-zero.
 
 e2fsck 1.46.5 does not. For a short symlink that owns an EA inode and has no
 xattr block, once the EA blocks are charged to it, e2fsck 1.46.5 reports
@@ -745,9 +756,12 @@ Tests:
   error, wrong length, and that the value takes no storage; for
   `readEAInodeValue`'s inode number range and its floor of 11; and for the
   extent error branches of the EA inode's block lookup (a block mapped twice,
-  an unwritten extent). `ext4/fs_test.go` pins `isFastSymlink` with and
-  without `ea_inode`, and the block-map bounds checks on hand-built indirect
-  blocks.
+  an unwritten extent, an extent at physical block 0). `ext4/fs_test.go`
+  pins `isFastSymlink` with and without `ea_inode`, and the block-map bounds
+  checks on hand-built indirect blocks: both rejection (past the end) and
+  acceptance (the last block, count-1, and block 1 where the first data
+  block is 1), and that a mapped block allocates no more than a hole
+  (`testing.AllocsPerRun`).
 - Image tests (`ext4/image_test.go`): values of 4040, 4041, 8192 and 65536
   bytes, two 64 KiB values on one inode, one inode with an inline, a block
   and an EA inode value, an ACL beside a large value (when the source
@@ -757,7 +771,13 @@ Tests:
   `mke2fs -d` never shares one); damaged EA inodes and pointers (out of
   range, reserved inode, directory, flag missing, size off by one, hole,
   block outside the filesystem); symlinks owning EA inodes; and block maps
-  pointing past the filesystem.
+  pointing past the filesystem. The source tree for the large values is
+  built under `/dev/shm`, because the default temp directory may refuse
+  values over about one block; tmpfs takes 64 KiB `user.*` values from
+  Linux 6.6. Without that, or without an `ea_inode`-capable `mke2fs`, these
+  tests skip, naming the reason, or fail when `EXT4_REQUIRE_TOOLS` is set.
+  Both CI unit-test runners (ubuntu-22.04 and ubuntu-24.04) run kernel 6.8
+  or later, so CI runs them.
 - End-to-end clone: a new CI row, `skeleton layout with ea_inode`
   (`-I 512 -O ^has_journal,^orphan_file,ea_inode`, ubuntu-24.04). With
   `ea_inode`, `scripts/e2e-populate.sh` adds files with an 8 KiB, a 64 KiB,

@@ -264,8 +264,8 @@ func (ext4 *FileSystem) readEAInodeValue(inum uint32, size int) ([]byte, error) 
 		if blk == 0 {
 			return nil, xerrors.Errorf("EA inode %d: block %d of the value is a hole", inum, i)
 		}
-		if err := ext4.checkPhysicalBlocks(blk, 1, fmt.Sprintf("EA inode %d block %d", inum, i)); err != nil {
-			return nil, err
+		if !ext4.physicalBlocksInside(blk, 1) {
+			return nil, ext4.checkPhysicalBlocks(blk, 1, fmt.Sprintf("EA inode %d block %d", inum, i))
 		}
 		chunk := value[int64(i)*blockSize:]
 		if int64(len(chunk)) > blockSize {
@@ -307,6 +307,9 @@ func (ext4 *FileSystem) eaInodeBlocks(inode *Inode, nblocks int64) ([]int64, err
 			}
 			if e.IsUninitialized() {
 				return nil, xerrors.Errorf("logical block %d is in an unwritten extent", start+j)
+			}
+			if e.offset()+j == 0 {
+				return nil, xerrors.Errorf("logical block %d maps to physical block 0", start+j)
 			}
 			physical[start+j] = e.offset() + j
 		}

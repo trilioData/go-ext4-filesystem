@@ -336,8 +336,8 @@ func (i *Inode) GetBlockAddresses(ext4 *FileSystem) ([]uint32, error) {
 		if addr == 0 {
 			continue
 		}
-		if err := ext4.checkPhysicalBlocks(int64(addr), 1, fmt.Sprintf("data block %d", j)); err != nil {
-			return nil, err
+		if !ext4.physicalBlocksInside(int64(addr), 1) {
+			return nil, ext4.checkPhysicalBlocks(int64(addr), 1, fmt.Sprintf("data block %d", j))
 		}
 	}
 

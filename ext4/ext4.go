@@ -223,15 +223,21 @@ func (ext4 *FileSystem) extents(b []byte, extents []Extent, expectedDepth int) (
 // FirstDataBlock and the range must end at or before the last block. Same
 // check the xattr block already makes.
 func (ext4 *FileSystem) checkPhysicalBlocks(start, count int64, what string) error {
-	first := int64(ext4.sb.FirstDataBlock)
-	total := ext4.sb.GetBlockCount()
-
-	if start < first || start >= total || start+count > total {
+	if !ext4.physicalBlocksInside(start, count) {
 		return xerrors.Errorf(
 			"%s: physical block %d + %d blocks is outside the filesystem (blocks %d..%d)",
-			what, start, count, first, total-1)
+			what, start, count, int64(ext4.sb.FirstDataBlock), ext4.sb.GetBlockCount()-1)
 	}
 	return nil
+}
+
+// physicalBlocksInside is checkPhysicalBlocks without the error. Loops over
+// many blocks call it first and build the error's description only on
+// failure, so the check costs no allocation per block.
+func (ext4 *FileSystem) physicalBlocksInside(start, count int64) bool {
+	first := int64(ext4.sb.FirstDataBlock)
+	total := ext4.sb.GetBlockCount()
+	return start >= first && start < total && start+count <= total
 }
 
 func (e *Extent) offset() int64 {

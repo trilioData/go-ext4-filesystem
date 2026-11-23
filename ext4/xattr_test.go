@@ -574,6 +574,12 @@ func TestEAInodeBlocksExtents(t *testing.T) {
 		{"unwritten first extent", eaExtentInode(
 			Extent{Block: 0, Len: unwritten + 2, StartLo: 10},
 		), 2, "logical block 0 is in an unwritten extent"},
+		// 0 is what eaInodeBlocks returns for an unmapped block, so an
+		// extent pointing at physical block 0 is refused by name here
+		// rather than reported later as a hole.
+		{"extent at physical block 0", eaExtentInode(
+			Extent{Block: 0, Len: 1, StartLo: 0},
+		), 1, "logical block 0 maps to physical block 0"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
