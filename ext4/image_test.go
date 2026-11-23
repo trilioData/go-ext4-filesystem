@@ -36,6 +36,26 @@ import (
 
 // ---------------------------------------------------------------- helpers
 
+// skipUnlessRequired skips with the given reason, or fails with it when
+// EXT4_REQUIRE_TOOLS is set: in CI a missing prerequisite must turn the job
+// red rather than let the test pass by not running.
+func skipUnlessRequired(t *testing.T, format string, args ...interface{}) {
+	t.Helper()
+	if os.Getenv("EXT4_REQUIRE_TOOLS") != "" {
+		t.Fatalf(format+" (EXT4_REQUIRE_TOOLS is set)", args...)
+	}
+	t.Skipf(format, args...)
+}
+
+// kernelRelease returns the running kernel's release, or "unknown".
+func kernelRelease() string {
+	b, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(b))
+}
+
 func requireTools(t *testing.T, tools ...string) {
 	t.Helper()
 	for _, tool := range tools {
@@ -877,7 +897,7 @@ func TestImageUnsupportedFeatures(t *testing.T) {
 		cmd := exec.Command("mke2fs", "-q", "-F", "-t", "ext4", "-b", "4096",
 			"-O", baseFeatures+",extent,64bit,flex_bg,extra_isize,ea_inode", img, "64M")
 		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Skipf("this mke2fs cannot create ea_inode: %v\n%s", err, out)
+			skipUnlessRequired(t, "this mke2fs cannot create ea_inode: %v\n%s", err, out)
 		}
 		f, err := os.Open(img)
 		if err != nil {
@@ -1007,18 +1027,20 @@ var eaInodeConfigNames = []string{"skeleton-4k-i512", "ext4-1k-i256", "ext3-1k-b
 
 // shmSourceDir returns an empty directory under /dev/shm. The default temp
 // directory's filesystem may refuse xattr values over about 4 KiB; tmpfs
-// takes 64 KiB. Skips when /dev/shm cannot hold a 64 KiB user.* value.
+// takes 64 KiB. Skips when /dev/shm cannot hold a 64 KiB user.* value, or
+// fails when EXT4_REQUIRE_TOOLS is set.
 func shmSourceDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/dev/shm", "ext4-ea-inode-")
 	if err != nil {
-		t.Skipf("no usable /dev/shm: %v", err)
+		skipUnlessRequired(t, "no usable /dev/shm for the large-xattr source tree: %v", err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	probe := filepath.Join(dir, "probe")
 	writeFile(t, probe, nil, 0o644)
 	if err := syscall.Setxattr(probe, "user.probe", make([]byte, xattrValueMax), 0); err != nil {
-		t.Skipf("/dev/shm does not take a 64 KiB user.* xattr: %v", err)
+		skipUnlessRequired(t, "/dev/shm does not take a 64 KiB user.* xattr (tmpfs takes user.* "+
+			"xattrs from Linux 6.6; this kernel: %s): %v", kernelRelease(), err)
 	}
 	if err := os.Remove(probe); err != nil {
 		t.Fatal(err)
