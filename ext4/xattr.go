@@ -145,7 +145,8 @@ func (ext4 *FileSystem) readInlineXattrs(raw []byte, out map[string][]byte) erro
 	// starts at its beginning -- so value offsets are measured from the
 	// same point the entries begin.
 	region := raw[magicAt+4:]
-	return parseXattrEntries(region, 0, len(region), ext4.sb.FeatureIncompatEaInode(), out)
+	return parseXattrEntries(region, 0, len(region), ext4.sb.FeatureIncompatEaInode(),
+		readEANotSupported, out)
 }
 
 // readBlockXattrs reads attributes stored in a separate block.
@@ -185,7 +186,7 @@ func (ext4 *FileSystem) readBlockXattrs(raw []byte, out map[string][]byte) error
 	// entriesBase is 32 because value offsets are measured from the block
 	// start while entries begin after the header.
 	return parseXattrEntries(block, xattrHeaderSize, int(blockSize)-xattrHeaderSize,
-		ext4.sb.FeatureIncompatEaInode(), out)
+		ext4.sb.FeatureIncompatEaInode(), readEANotSupported, out)
 }
 
 // entryLen is EXT2_EXT_ATTR_LEN: the on-disk size of one entry, its name
@@ -194,14 +195,30 @@ func entryLen(nameLen int) int {
 	return (nameLen + 3 + xattrEntrySize) & ^3
 }
 
+// eaValueReader returns the value stored in EA inode inum, which the
+// xattr entry says is size bytes long.
+type eaValueReader func(inum uint32, size int) ([]byte, error)
+
+// errEAInodeNotSupported is what readEANotSupported returns.
+var errEAInodeNotSupported = xerrors.New("ea_inode is not supported")
+
+// readEANotSupported is an eaValueReader that refuses every EA inode.
+func readEANotSupported(uint32, int) ([]byte, error) {
+	return nil, errEAInodeNotSupported
+}
+
 // parseXattrEntries walks an entry table and appends what it finds to out.
 //
 // region is the whole storage area that value offsets index into.
 // entriesBase is where the entry table starts within it -- 0 for the inline
 // case, 32 for a block. storageSize is how much of the region the entry table
 // and its values may occupy.
+//
+// A value stored in a separate EA inode (e_value_inum != 0, ea_inode feature)
+// is fetched through readEA. Such a value takes no room in the region: its
+// e_value_offs is not read and its size does not count against storageSize.
 func parseXattrEntries(region []byte, entriesBase, storageSize int,
-	eaInodeFeature bool, out map[string][]byte) error {
+	eaInodeFeature bool, readEA eaValueReader, out map[string][]byte) error {
 
 	if entriesBase+storageSize > len(region) {
 		return xerrors.Errorf("xattr storage size %d overruns region %d",
@@ -226,9 +243,7 @@ func parseXattrEntries(region []byte, entriesBase, storageSize int,
 
 		nameLen := int(e[0])
 		nameIndex := e[1]
-		valueOffs := int(binary.LittleEndian.Uint16(e[2:]))
 		valueInum := binary.LittleEndian.Uint32(e[4:])
-		valueSize := int(binary.LittleEndian.Uint32(e[8:]))
 
 		remain -= xattrEntrySize
 		nameSpace := (nameLen + 3) & ^3
@@ -251,10 +266,32 @@ func parseXattrEntries(region []byte, entriesBase, storageSize int,
 				return xerrors.Errorf("xattr %q has value inode %d but ea_inode feature is not set",
 					name, valueInum)
 			}
-			return xerrors.Errorf("xattr %q is stored in inode %d: ea_inode is not supported",
-				name, valueInum)
+			// Checked on the raw field, before any conversion to int.
+			rawSize := binary.LittleEndian.Uint32(e[8:])
+			if rawSize == 0 {
+				return xerrors.Errorf("xattr %q in inode %d has value size 0", name, valueInum)
+			}
+			if rawSize > xattrValueMax {
+				return xerrors.Errorf("xattr %q value size %d exceeds maximum %d",
+					name, rawSize, xattrValueMax)
+			}
+			if readEA == nil {
+				return xerrors.Errorf("xattr %q is stored in inode %d but no EA inode reader was given",
+					name, valueInum)
+			}
+			value, err := readEA(valueInum, int(rawSize))
+			if err != nil {
+				return xerrors.Errorf("xattr %q is stored in inode %d: %w", name, valueInum, err)
+			}
+			if len(value) != int(rawSize) {
+				return xerrors.Errorf("xattr %q: inode %d returned %d bytes, want %d",
+					name, valueInum, len(value), rawSize)
+			}
+			out[name] = value
 
 		default:
+			valueOffs := int(binary.LittleEndian.Uint16(e[2:]))
+			valueSize := int(binary.LittleEndian.Uint32(e[8:]))
 			if valueSize > remain {
 				return xerrors.Errorf("xattr %q value size %d exceeds remaining storage %d",
 					name, valueSize, remain)

@@ -3,6 +3,7 @@ package ext4
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -75,18 +76,49 @@ func assertXattrs(t *testing.T, got, want map[string][]byte) {
 	}
 }
 
-// assertParseError runs parseXattrEntries and checks the error text.
+// assertParseError runs parseXattrEntries and checks the error text. It
+// returns the error so callers can inspect it further.
 func assertParseError(t *testing.T, region []byte, entriesBase, storageSize int,
-	eaInode bool, wantSubstr string) {
+	eaInode bool, readEA eaValueReader, wantSubstr string) error {
 	t.Helper()
 	out := make(map[string][]byte)
-	err := parseXattrEntries(region, entriesBase, storageSize, eaInode, out)
+	err := parseXattrEntries(region, entriesBase, storageSize, eaInode, readEA, out)
 	if err == nil {
 		t.Fatalf("parseXattrEntries succeeded with %v, want an error containing %q", out, wantSubstr)
 	}
 	if !strings.Contains(err.Error(), wantSubstr) {
 		t.Errorf("parseXattrEntries error = %q, want it to contain %q", err, wantSubstr)
 	}
+	return err
+}
+
+// eaCall records one call to a fake eaValueReader.
+type eaCall struct {
+	inum uint32
+	size int
+}
+
+// fakeEAReader returns a reader that answers from values, keyed by inode
+// number, and records every call. Each call returns a fresh copy.
+func fakeEAReader(values map[uint32][]byte, calls *[]eaCall) eaValueReader {
+	return func(inum uint32, size int) ([]byte, error) {
+		*calls = append(*calls, eaCall{inum, size})
+		v, ok := values[inum]
+		if !ok {
+			return nil, errors.New("fake: no such EA inode")
+		}
+		return append([]byte(nil), v...), nil
+	}
+}
+
+// pattern returns n bytes of a repeating, position-dependent pattern, so a
+// truncated or shifted value does not compare equal.
+func pattern(n int, seed byte) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i) ^ seed
+	}
+	return b
 }
 
 // Inline storage: the entry table starts at offset 0 of the region and value
@@ -101,7 +133,7 @@ func TestParseXattrInline(t *testing.T) {
 	)
 
 	out := make(map[string][]byte)
-	if err := parseXattrEntries(region, 0, len(region), false, out); err != nil {
+	if err := parseXattrEntries(region, 0, len(region), false, nil, out); err != nil {
 		t.Fatalf("parseXattrEntries: %v", err)
 	}
 	assertXattrs(t, out, map[string][]byte{
@@ -125,7 +157,7 @@ func TestParseXattrBlock(t *testing.T) {
 	}
 
 	out := make(map[string][]byte)
-	if err := parseXattrEntries(region, base, len(region)-base, false, out); err != nil {
+	if err := parseXattrEntries(region, base, len(region)-base, false, nil, out); err != nil {
 		t.Fatalf("parseXattrEntries: %v", err)
 	}
 	assertXattrs(t, out, map[string][]byte{
@@ -143,7 +175,7 @@ func TestParseXattrEmptyValue(t *testing.T) {
 	)
 
 	out := make(map[string][]byte)
-	if err := parseXattrEntries(region, 0, len(region), false, out); err != nil {
+	if err := parseXattrEntries(region, 0, len(region), false, nil, out); err != nil {
 		t.Fatalf("parseXattrEntries: %v", err)
 	}
 	assertXattrs(t, out, map[string][]byte{
@@ -167,17 +199,18 @@ func TestParseXattrTerminator(t *testing.T) {
 	copy(region[end+4:], ghost[:entryLen(len("ghost"))])
 
 	out := make(map[string][]byte)
-	if err := parseXattrEntries(region, 0, len(region), false, out); err != nil {
+	if err := parseXattrEntries(region, 0, len(region), false, nil, out); err != nil {
 		t.Fatalf("parseXattrEntries: %v", err)
 	}
 	assertXattrs(t, out, map[string][]byte{"user.kept": []byte("v")})
 
 	// Garbage after the terminator that would fail the walk is ignored too.
+	// Bytes end+4 .. end+20 are the 16-byte entry header just past the terminator word.
 	for i := end + 4; i < end+20; i++ {
 		region[i] = 0xff
 	}
 	out = make(map[string][]byte)
-	if err := parseXattrEntries(region, 0, len(region), false, out); err != nil {
+	if err := parseXattrEntries(region, 0, len(region), false, nil, out); err != nil {
 		t.Fatalf("parseXattrEntries with garbage after the terminator: %v", err)
 	}
 	assertXattrs(t, out, map[string][]byte{"user.kept": []byte("v")})
@@ -187,26 +220,26 @@ func TestParseXattrErrors(t *testing.T) {
 	t.Run("name length overruns storage", func(t *testing.T) {
 		region := buildXattrRegion(0, 32, testEntry{index: 1, name: "a"})
 		region[0] = 200 // e_name_len
-		assertParseError(t, region, 0, len(region), false, "xattr name length 200 overruns storage")
+		assertParseError(t, region, 0, len(region), false, nil, "xattr name length 200 overruns storage")
 	})
 
 	t.Run("value size exceeds remaining storage", func(t *testing.T) {
 		// 64 bytes of storage less a 20-byte entry leaves 44.
 		region := buildXattrRegion(0, 64, testEntry{index: 1, name: "a", offs: 24, size: 45})
-		assertParseError(t, region, 0, len(region), false,
+		assertParseError(t, region, 0, len(region), false, nil,
 			`xattr "user.a" value size 45 exceeds remaining storage 44`)
 	})
 
 	t.Run("value size over 64 KiB", func(t *testing.T) {
 		region := buildXattrRegion(0, 70000,
 			testEntry{index: 1, name: "a", offs: 24, size: xattrValueMax + 1})
-		assertParseError(t, region, 0, len(region), false,
+		assertParseError(t, region, 0, len(region), false, nil,
 			`xattr "user.a" value size 65537 exceeds maximum 65536`)
 	})
 
 	t.Run("value offset plus size past the region", func(t *testing.T) {
 		region := buildXattrRegion(0, 64, testEntry{index: 1, name: "a", offs: 60, size: 8})
-		assertParseError(t, region, 0, len(region), false,
+		assertParseError(t, region, 0, len(region), false, nil,
 			`xattr "user.a" value at 60+8 overruns region 64`)
 	})
 
@@ -214,21 +247,69 @@ func TestParseXattrErrors(t *testing.T) {
 		// The table ends at 20; values may start at 24, past the terminator.
 		// No value bytes are written, so the terminator stays intact.
 		region := buildXattrRegion(0, 64, testEntry{index: 1, name: "a", offs: 20, size: 4})
-		assertParseError(t, region, 0, len(region), false,
+		assertParseError(t, region, 0, len(region), false, nil,
 			`xattr "user.a" value offset 20 overlaps the entry table`)
 	})
 
 	t.Run("value overlaps the block header", func(t *testing.T) {
 		// Block case: an offset inside the header is also before the table end.
 		region := buildXattrRegion(xattrHeaderSize, 64, testEntry{index: 1, name: "a", offs: 4, size: 4})
-		assertParseError(t, region, xattrHeaderSize, 64, false,
+		assertParseError(t, region, xattrHeaderSize, 64, false, nil,
 			`xattr "user.a" value offset 4 overlaps the entry table`)
 	})
 
 	t.Run("storage size overruns the region", func(t *testing.T) {
 		region := buildXattrRegion(xattrHeaderSize, 32)
-		assertParseError(t, region, xattrHeaderSize, 64, false,
+		assertParseError(t, region, xattrHeaderSize, 64, false, nil,
 			"xattr storage size 96 overruns region 64")
+	})
+}
+
+// Accept-side boundaries of the inline value checks: each limit is inclusive.
+func TestParseXattrBoundaries(t *testing.T) {
+	t.Run("value offset exactly past the terminator", func(t *testing.T) {
+		// The table ends at 20 (one entry with a 1-byte name); 24 is the first
+		// offset past the 4-byte terminator.
+		region := buildXattrRegion(0, 64, testEntry{index: 1, name: "a", offs: 24, value: []byte("abcd")})
+		out := make(map[string][]byte)
+		if err := parseXattrEntries(region, 0, len(region), false, nil, out); err != nil {
+			t.Fatalf("parseXattrEntries: %v", err)
+		}
+		assertXattrs(t, out, map[string][]byte{"user.a": []byte("abcd")})
+	})
+
+	t.Run("block value offset exactly past the terminator", func(t *testing.T) {
+		// Block case: the table ends at 32+20, so 32+24 is the first legal offset.
+		const base = xattrHeaderSize
+		region := buildXattrRegion(base, 64, testEntry{index: 1, name: "a", offs: base + 24, value: []byte("abcd")})
+		out := make(map[string][]byte)
+		if err := parseXattrEntries(region, base, 64, false, nil, out); err != nil {
+			t.Fatalf("parseXattrEntries: %v", err)
+		}
+		assertXattrs(t, out, map[string][]byte{"user.a": []byte("abcd")})
+	})
+
+	t.Run("value size equals remaining storage", func(t *testing.T) {
+		// remain does not count the terminator, so a value can only use all of
+		// it when storageSize is smaller than the region. Storage 64 less a
+		// 20-byte entry leaves exactly 44; the value sits at 24..68.
+		value := bytes.Repeat([]byte{'v'}, 44)
+		region := buildXattrRegion(0, 68, testEntry{index: 1, name: "a", offs: 24, value: value})
+		out := make(map[string][]byte)
+		if err := parseXattrEntries(region, 0, 64, false, nil, out); err != nil {
+			t.Fatalf("parseXattrEntries: %v", err)
+		}
+		assertXattrs(t, out, map[string][]byte{"user.a": value})
+	})
+
+	t.Run("value of exactly 64 KiB", func(t *testing.T) {
+		value := bytes.Repeat([]byte{0x5a}, xattrValueMax)
+		region := buildXattrRegion(0, 24+xattrValueMax, testEntry{index: 1, name: "a", offs: 24, value: value})
+		out := make(map[string][]byte)
+		if err := parseXattrEntries(region, 0, len(region), false, nil, out); err != nil {
+			t.Fatalf("parseXattrEntries: %v", err)
+		}
+		assertXattrs(t, out, map[string][]byte{"user.a": value})
 	})
 }
 
@@ -236,14 +317,147 @@ func TestParseXattrErrors(t *testing.T) {
 // declare ea_inode.
 func TestParseXattrValueInodeWithoutFeature(t *testing.T) {
 	region := buildXattrRegion(0, 64, testEntry{index: 1, name: "big", size: 100000, inum: 12})
-	assertParseError(t, region, 0, len(region), false,
+	assertParseError(t, region, 0, len(region), false, nil,
 		`xattr "user.big" has value inode 12 but ea_inode feature is not set`)
 }
 
-// With ea_inode declared, a value stored in another inode is still refused:
-// reading EA inodes is not implemented yet.
+// With ea_inode declared, the callers pass a reader that refuses every EA
+// inode until reading them is implemented; its error reaches the caller
+// with the same text as before the reader existed.
 func TestParseXattrValueInodeUnsupported(t *testing.T) {
-	region := buildXattrRegion(0, 64, testEntry{index: 1, name: "big", size: 100000, inum: 12})
-	assertParseError(t, region, 0, len(region), true,
+	region := buildXattrRegion(0, 64, testEntry{index: 1, name: "big", size: 8192, inum: 12})
+	assertParseError(t, region, 0, len(region), true, readEANotSupported,
 		`xattr "user.big" is stored in inode 12: ea_inode is not supported`)
+}
+
+// A value stored in an EA inode is fetched through the reader, which is told
+// the inode number and the size the entry declares.
+func TestParseXattrValueInode(t *testing.T) {
+	want := pattern(8192, 0x3c)
+	var calls []eaCall
+	readEA := fakeEAReader(map[uint32][]byte{12: want}, &calls)
+	region := buildXattrRegion(0, 64, testEntry{index: 1, name: "big", size: 8192, inum: 12})
+
+	out := make(map[string][]byte)
+	if err := parseXattrEntries(region, 0, len(region), true, readEA, out); err != nil {
+		t.Fatalf("parseXattrEntries: %v", err)
+	}
+	assertXattrs(t, out, map[string][]byte{"user.big": want})
+	if len(calls) != 1 || calls[0] != (eaCall{12, 8192}) {
+		t.Errorf("reader calls = %v, want [{12 8192}]", calls)
+	}
+}
+
+// An EA-inode value does not use the storage area: its size is not taken from
+// the remaining budget and its offset is not read. A 64 KiB EA-inode value
+// sits beside two inline values in a 256-byte region, and all three come
+// back.
+func TestParseXattrValueInodeBesideInline(t *testing.T) {
+	big := pattern(xattrValueMax, 0xa5)
+	var calls []eaCall
+	readEA := fakeEAReader(map[uint32][]byte{40: big}, &calls)
+	region := buildXattrRegion(0, 256,
+		testEntry{index: 1, name: "small1", value: []byte("first")},
+		// offs 1 lies inside the entry table, which an inline value would be
+		// refused for; an EA-inode entry's offset must be ignored.
+		testEntry{index: 1, name: "big", offs: 1, size: xattrValueMax, inum: 40},
+		testEntry{index: 6, name: "small2", value: []byte("second value")},
+	)
+
+	out := make(map[string][]byte)
+	if err := parseXattrEntries(region, 0, len(region), true, readEA, out); err != nil {
+		t.Fatalf("parseXattrEntries: %v", err)
+	}
+	assertXattrs(t, out, map[string][]byte{
+		"user.small1":     []byte("first"),
+		"user.big":        big,
+		"security.small2": []byte("second value"),
+	})
+	if len(calls) != 1 || calls[0] != (eaCall{40, xattrValueMax}) {
+		t.Errorf("reader calls = %v, want [{40 %d}]", calls, xattrValueMax)
+	}
+}
+
+// Two entries may name the same EA inode (ext4 shares EA inodes between
+// identical values). Both are returned.
+func TestParseXattrSharedValueInode(t *testing.T) {
+	want := pattern(300, 0x11)
+	var calls []eaCall
+	readEA := fakeEAReader(map[uint32][]byte{77: want}, &calls)
+	region := buildXattrRegion(0, 96,
+		testEntry{index: 1, name: "a", size: 300, inum: 77},
+		testEntry{index: 4, name: "b", size: 300, inum: 77},
+	)
+
+	out := make(map[string][]byte)
+	if err := parseXattrEntries(region, 0, len(region), true, readEA, out); err != nil {
+		t.Fatalf("parseXattrEntries: %v", err)
+	}
+	assertXattrs(t, out, map[string][]byte{
+		"user.a":    want,
+		"trusted.b": want,
+	})
+	if len(calls) != 2 {
+		t.Errorf("reader calls = %v, want two", calls)
+	}
+}
+
+func TestParseXattrValueInodeErrors(t *testing.T) {
+	// failIfCalled is a reader that must not be reached.
+	failIfCalled := func(t *testing.T) eaValueReader {
+		return func(inum uint32, size int) ([]byte, error) {
+			t.Errorf("reader called with inode %d size %d", inum, size)
+			return make([]byte, size), nil
+		}
+	}
+
+	t.Run("size 0", func(t *testing.T) {
+		region := buildXattrRegion(0, 64, testEntry{index: 1, name: "big", inum: 12})
+		assertParseError(t, region, 0, len(region), true, failIfCalled(t),
+			`xattr "user.big" in inode 12 has value size 0`)
+	})
+
+	t.Run("size over 64 KiB", func(t *testing.T) {
+		region := buildXattrRegion(0, 64,
+			testEntry{index: 1, name: "big", size: xattrValueMax + 1, inum: 12})
+		assertParseError(t, region, 0, len(region), true, failIfCalled(t),
+			`xattr "user.big" value size 65537 exceeds maximum 65536`)
+	})
+
+	t.Run("reader error", func(t *testing.T) {
+		sentinel := errors.New("disk on fire")
+		readEA := func(uint32, int) ([]byte, error) { return nil, sentinel }
+		region := buildXattrRegion(0, 64, testEntry{index: 1, name: "big", size: 100, inum: 12})
+		err := assertParseError(t, region, 0, len(region), true, readEA,
+			`xattr "user.big" is stored in inode 12: disk on fire`)
+		if !errors.Is(err, sentinel) {
+			t.Errorf("error %v does not wrap the reader's error", err)
+		}
+	})
+
+	t.Run("reader returns a short value", func(t *testing.T) {
+		readEA := func(uint32, int) ([]byte, error) { return make([]byte, 99), nil }
+		region := buildXattrRegion(0, 64, testEntry{index: 1, name: "big", size: 100, inum: 12})
+		assertParseError(t, region, 0, len(region), true, readEA,
+			`xattr "user.big": inode 12 returned 99 bytes, want 100`)
+	})
+
+	t.Run("reader returns a long value", func(t *testing.T) {
+		readEA := func(uint32, int) ([]byte, error) { return make([]byte, 101), nil }
+		region := buildXattrRegion(0, 64, testEntry{index: 1, name: "big", size: 100, inum: 12})
+		assertParseError(t, region, 0, len(region), true, readEA,
+			`xattr "user.big": inode 12 returned 101 bytes, want 100`)
+	})
+
+	t.Run("nil reader", func(t *testing.T) {
+		region := buildXattrRegion(0, 64, testEntry{index: 1, name: "big", size: 100, inum: 12})
+		assertParseError(t, region, 0, len(region), true, nil,
+			`xattr "user.big" is stored in inode 12 but no EA inode reader was given`)
+	})
+
+	t.Run("feature off wins over the reader", func(t *testing.T) {
+		region := buildXattrRegion(0, 64, testEntry{index: 1, name: "big", size: 100, inum: 12})
+		assertParseError(t, region, 0, len(region), false, failIfCalled(t),
+			`xattr "user.big" has value inode 12 but ea_inode feature is not set`)
+	})
 }
