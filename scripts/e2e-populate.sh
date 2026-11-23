@@ -106,23 +106,49 @@ setfattr -n user.on-dir -v yes xattr
 # ea_inode feature: without it the kernel refuses them (ENOSPC). Values are
 # passed base64-encoded ("0s"): a 64 KiB value in hex would be one argument
 # longer than the kernel's 128 KiB limit for a single argument.
-dev=$(findmnt -no SOURCE --target . 2>/dev/null || true)
-if [ -n "$dev" ] && dumpe2fs -h "$dev" 2>/dev/null | grep '^Filesystem features:.*\bea_inode\b' >/dev/null; then
+#
+# EXT4_E2E_EA_INODE=1 or 0 says whether the filesystem has ea_inode
+# (e2e-clone.sh sets it from the image). Told 1, the script fails rather than
+# go on without the large values. Unset, it is detected from the mount's
+# device, and anything that cannot be detected counts as absent.
+ea_inode=${EXT4_E2E_EA_INODE:-}
+if [ -z "$ea_inode" ]; then
+  ea_inode=0
+  dev=$(findmnt -no SOURCE --target . 2>/dev/null || true)
+  if [ -n "$dev" ] && dumpe2fs -h "$dev" 2>/dev/null | grep '^Filesystem features:.*\bea_inode\b' >/dev/null; then
+    ea_inode=1
+  fi
+fi
+case $ea_inode in
+  0|1) ;;
+  *) echo "EXT4_E2E_EA_INODE must be 0 or 1, not '$ea_inode'" >&2; exit 1 ;;
+esac
+if [ "$ea_inode" = 1 ]; then
   b64() { rnd "$1" | base64 -w0; }
-  echo 8k > xattr/big8k;    setfattr -n user.blob -v "0s$(b64 8192)" xattr/big8k
-  echo 64k > xattr/big64k;  setfattr -n user.blob -v "0s$(b64 65536)" xattr/big64k
+  big_fail() { echo "e2e-populate: the filesystem has ea_inode but $*" >&2; exit 1; }
+  # setbig <path> <name> <bytes> [base64 value]: set the value (random when
+  # not given) and check that it reads back with that many bytes.
+  setbig() {
+    local v n
+    v=${4:-$(b64 "$3")}
+    setfattr -n "$2" -v "0s$v" "$1" || big_fail "setting $2 ($3 bytes) on $1 failed"
+    n=$(getfattr --only-values -n "$2" "$1" | wc -c) || big_fail "reading $2 back from $1 failed"
+    [ "$n" = "$3" ] || big_fail "$2 on $1 reads back $n bytes, not $3"
+  }
+  echo 8k > xattr/big8k;    setbig xattr/big8k user.blob 8192
+  echo 64k > xattr/big64k;  setbig xattr/big64k user.blob 65536
   echo many > xattr/bigmany
-  for i in 1 2 3; do setfattr -n "user.blob$i" -v "0s$(b64 20000)" xattr/bigmany; done
+  for i in 1 2 3; do setbig xattr/bigmany "user.blob$i" 20000; done
   # In the inode (with 512-byte inodes), in the xattr block, in an EA inode.
   echo mixed > xattr/bigmixed
-  setfattr -n user.small -v "0s$(b64 10)" xattr/bigmixed
-  setfattr -n user.medium -v "0s$(b64 3000)" xattr/bigmixed
-  setfattr -n user.large -v "0s$(b64 16384)" xattr/bigmixed
-  # Identical large values: the kernel stores them in one shared EA inode.
+  setbig xattr/bigmixed user.small 10
+  setbig xattr/bigmixed user.medium 3000
+  setbig xattr/bigmixed user.large 16384
+  # Identical large values, which the kernel may store in one shared EA inode.
   shared=$(b64 8192)
-  echo a > xattr/shared-a;  setfattr -n user.blob -v "0s$shared" xattr/shared-a
-  echo b > xattr/shared-b;  setfattr -n user.blob -v "0s$shared" xattr/shared-b
-  mkdir xattr/big-dir;      setfattr -n user.blob -v "0s$(b64 8192)" xattr/big-dir
+  echo a > xattr/shared-a;  setbig xattr/shared-a user.blob 8192 "$shared"
+  echo b > xattr/shared-b;  setbig xattr/shared-b user.blob 8192 "$shared"
+  mkdir xattr/big-dir;      setbig xattr/big-dir user.blob 8192
   echo "ea_inode: added large xattr values"
 fi
 

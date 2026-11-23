@@ -31,10 +31,15 @@ truncate -s "$size" "$img"
 # shellcheck disable=SC2086
 mkfs.ext4 -F -q ${MKFS_OPTS:-} "$img"
 dumpe2fs -h "$img" 2>/dev/null | grep -E "features|Block size|Inode size"
+# Detected once, from the image: the populate script is told rather than
+# left to detect it, so a failed detection cannot skip the large values.
+features=$(dumpe2fs -h "$img" 2>/dev/null | grep '^Filesystem features:')
+ea_inode=0
+case " $features " in *" ea_inode "*) ea_inode=1 ;; esac
 
 mkdir -p "$src"
 mount -o loop "$img" "$src"
-bash "$repo/scripts/e2e-populate.sh" "$src" "$big"
+EXT4_E2E_EA_INODE=$ea_inode bash "$repo/scripts/e2e-populate.sh" "$src" "$big"
 umount "$src"
 e2fsck -fn "$img"
 mount -o loop,ro "$img" "$src"
@@ -43,7 +48,7 @@ mount -o loop,ro "$img" "$src"
 # without the feature refuses (ENOSPC), and /tmp may be one. Clone onto an
 # ext4 formatted like the source then, into a subdirectory so its own
 # lost+found stays out of the comparison.
-if dumpe2fs -h "$img" 2>/dev/null | grep '^Filesystem features:.*\bea_inode\b' >/dev/null; then
+if [ "$ea_inode" = 1 ]; then
   truncate -s "$size" "$work/clone.img"
   # shellcheck disable=SC2086
   mkfs.ext4 -F -q ${MKFS_OPTS:-} "$work/clone.img"

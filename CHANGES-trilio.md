@@ -39,9 +39,13 @@ Every section has a plain description first and a fuller one after it.
 | `ext4/fs.go` | modified | fast-symlink test on `ea_inode` filesystems (§15) |
 | `ext4/inode.go` | modified | refuse a block-map indirect or data block outside the filesystem (§7, §15) |
 | `ext4/xattr_test.go`, `ext4/fs_test.go`, `ext4/image_test.go` | modified | tests for §15: entry parser, EA inode reads, damaged EA inodes, symlinks, block maps |
-| `scripts/e2e-*.sh`, `e2e/clone_test.go`, `.github/workflows/test.yml` | modified | end-to-end clone with `ea_inode` and large xattr values (§15) |
+| `scripts/e2e-*.sh`, `.github/workflows/test.yml` | modified | end-to-end clone with `ea_inode` and large xattr values (§15) |
+| `e2e/clone_test.go` | modified | comment only: the block-count check's comment mentions EA inode blocks; the check is unchanged (§15) |
 
-Roughly 1,060 lines added across the fork.
+Roughly 4,600 lines of Go added in `ext4/` across the fork, net of lines
+removed and counted against the upstream base (`fe51f5b`); about 1,270 of
+them are library code and the rest tests. The end-to-end harness (`e2e/`,
+`scripts/`) and CI are not counted.
 
 ---
 
@@ -721,9 +725,10 @@ listed above and allocates a fresh slice per call.
 `isFastSymlink` agrees with the kernel. Linux (current master)
 `ext4_inode_is_fast_symlink` decides by size alone on an `ea_inode`
 filesystem (a symlink, size non-zero and below 60) without looking at
-`i_blocks`; the reader's rule gives the same answer for every non-empty
-target. An empty target is fast only when `i_blocks` counts at most an xattr
-block, as before. e2fsprogs master (`ext2fs_inode_has_valid_blocks2`) falls
+`i_blocks`; the reader's rule gives the same answer for every well-formed
+link with a non-empty target (the `i_blocks` test still runs first, so a
+damaged link can differ). An empty target is fast only when `i_blocks`
+counts at most an xattr block, as before. e2fsprogs master (`ext2fs_inode_has_valid_blocks2`) falls
 through to the size test when `i_blocks` is non-zero.
 
 e2fsck 1.46.5 does not. For a short symlink that owns an EA inode and has no
@@ -757,10 +762,15 @@ Tests:
   (`-I 512 -O ^has_journal,^orphan_file,ea_inode`, ubuntu-24.04). With
   `ea_inode`, `scripts/e2e-populate.sh` adds files with an 8 KiB, a 64 KiB,
   three 20,000-byte, and a 10/3,000/16,384-byte set of values, two files
-  with the same 8 KiB value (one shared EA inode), and a directory with an
-  8 KiB value. Values go through `setfattr` in base64: in hex a 64 KiB value
-  is a single argument over the kernel's 128 KiB limit. Without `ea_inode`
-  the script does what it did before. `scripts/e2e-clone.sh` then clones
+  with the same 8 KiB value (identical values, which the kernel may store in
+  one shared EA inode), and a directory with an 8 KiB value. Each value is
+  read back with `getfattr` and its size checked. `scripts/e2e-clone.sh`
+  detects `ea_inode` from the image and passes it in `EXT4_E2E_EA_INODE`;
+  told the feature is present, the populate script fails with a message if
+  a large value cannot be set, so the row cannot pass without them. Values
+  go through `setfattr` in base64: in hex a 64 KiB value is a single
+  argument over the kernel's 128 KiB limit. Without `ea_inode` the script
+  does what it did before. `scripts/e2e-clone.sh` then clones
   onto a second ext4 formatted the same way, because an ext4 without
   `ea_inode` (as `/tmp` may be) refuses values over about one block with
   `ENOSPC`. The clone comparison's block-count check covers only large
