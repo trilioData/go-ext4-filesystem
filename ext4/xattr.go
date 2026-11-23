@@ -200,14 +200,6 @@ func entryLen(nameLen int) int {
 // xattr entry says is size bytes long.
 type eaValueReader func(inum uint32, size int) ([]byte, error)
 
-// errEAInodeNotSupported is what readEANotSupported returns.
-var errEAInodeNotSupported = xerrors.New("ea_inode is not supported")
-
-// readEANotSupported is an eaValueReader that refuses every EA inode.
-func readEANotSupported(uint32, int) ([]byte, error) {
-	return nil, errEAInodeNotSupported
-}
-
 // goodOldFirstIno is EXT2_GOOD_OLD_FIRST_INO: the first non-reserved inode
 // on a revision 0 filesystem, whose superblock has no s_first_ino.
 const goodOldFirstIno = 11
@@ -247,6 +239,12 @@ func (ext4 *FileSystem) readEAInodeValue(inum uint32, size int) ([]byte, error) 
 	}
 	if inode.Flags&EA_INODE_FL == 0 {
 		return nil, xerrors.Errorf("inode %d is not an EA inode (EA_INODE_FL not set, flags %#x)", inum, inode.Flags)
+	}
+	// A freed inode keeps its flags and size until reused: its blocks may
+	// already hold other data. e2fsprogs reports such an EA inode as
+	// corrupted (EXT2_ET_EA_INODE_CORRUPTED) and the kernel refuses it.
+	if inode.LinksCount == 0 {
+		return nil, xerrors.Errorf("EA inode %d is freed (links count 0)", inum)
 	}
 	if got := inode.GetSize(); got != int64(size) {
 		return nil, xerrors.Errorf("EA inode %d has size %d, entry says %d", inum, got, size)

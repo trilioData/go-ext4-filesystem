@@ -1366,6 +1366,8 @@ func TestImageEAInodeCorrupt(t *testing.T) {
 				{"directory", pointAt(uint32(dir)), "not a regular file"},
 				{"regular file without EA_INODE_FL", pointAt(uint32(plain)), "EA_INODE_FL"},
 				{"size one byte short", debugfsPatch(t, img, fmt.Sprintf("sif <%d> size 8191", ea)), "size 8191"},
+				// A freed EA inode: e2fsprogs reports EXT2_ET_EA_INODE_CORRUPTED.
+				{"links count 0", debugfsPatch(t, img, fmt.Sprintf("sif <%d> links_count 0", ea)), "links count 0"},
 				{"first extent removed (hole)", debugfsPatch(t, img, hole), "hole"},
 				{"block outside the filesystem", debugfsPatch(t, img, outside), "outside the filesystem"},
 			}

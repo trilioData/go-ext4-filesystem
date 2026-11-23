@@ -6,7 +6,17 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"golang.org/x/xerrors"
 )
+
+// errEAInodeNotSupported is what readEANotSupported returns.
+var errEAInodeNotSupported = xerrors.New("ea_inode is not supported")
+
+// readEANotSupported is an eaValueReader that refuses every EA inode.
+func readEANotSupported(uint32, int) ([]byte, error) {
+	return nil, errEAInodeNotSupported
+}
 
 // testEntry describes one ext2_ext_attr_entry for buildXattrRegion.
 type testEntry struct {

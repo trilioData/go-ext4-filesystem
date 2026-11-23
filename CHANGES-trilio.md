@@ -35,7 +35,7 @@ Every section has a plain description first and a fuller one after it.
 | `.github/workflows/test.yml` | **new** | CI on pull requests and on pushes to master/main (§13) |
 | `ext4/file.go`, `ext4/fs.go` | modified | file reads: one entry per extent instead of per block, one `ReadAt` per extent, no shared read offset (§14) |
 | `ext4/fs.go` | modified | refuse a superblock with zero blocks or inodes per group (§14, upstream #22) |
-| `ext4/xattr.go`, `ext4/features.go`, `ext4/const.go` | modified | accept `ea_inode`; read and validate xattr values stored in EA inodes (§15) |
+| `ext4/xattr.go`, `ext4/features.go`, `ext4/const.go` | modified | accept `ea_inode`; read and validate xattr values stored in EA inodes, refusing a freed one (links count 0) (§15) |
 | `ext4/fs.go` | modified | fast-symlink test on `ea_inode` filesystems (§15) |
 | `ext4/inode.go`, `ext4/ext4.go` | modified | refuse a block-map indirect or data block outside the filesystem, with no allocation per block on the passing path (§7, §15) |
 | `ext4/xattr_test.go`, `ext4/fs_test.go`, `ext4/image_test.go` | modified | tests for §15: entry parser, EA inode reads, damaged EA inodes, symlinks, block maps |
@@ -685,7 +685,8 @@ so those would have been refused.
   inode must declare a size from 1 byte to 64 KiB. The EA inode must be a
   number from the first non-reserved inode (never below 11, whatever the
   superblock says) to the inode count; a regular file; flagged
-  `EA_INODE_FL` (0x200000); and exactly as long as the entry says. Its data,
+  `EA_INODE_FL` (0x200000); not freed (links count above 0); and exactly
+  as long as the entry says. Its data,
   found through its extents or its block map, must have no hole and no
   unwritten extent, and every block must lie inside the filesystem. Anything
   else is an error naming the attribute and the reason, never a panic and
@@ -714,7 +715,10 @@ into the entry's hash. The reader does not verify it, as it verifies no
 checksums anywhere. What the checks above do and do not catch:
 
 - Detected: a pointer out of range or to a reserved inode; a pointer to an
-  inode that is not a regular file or lacks `EA_INODE_FL`; a size that does
+  inode that is not a regular file or lacks `EA_INODE_FL`; a freed EA inode
+  (links count 0, which e2fsprogs reports as `EXT2_ET_EA_INODE_CORRUPTED`
+  and the kernel refuses; a freed inode's blocks may already hold other
+  data); a size that does
   not match the entry; a hole, an unwritten extent, an extent pointing at
   physical block 0, or a block outside the filesystem in the value's data.
 - Not detected: an entry pointing at a different EA inode of the same size
@@ -730,7 +734,13 @@ size (0 and over 64 KiB refused, on the raw 32-bit field). A reader result
 of the wrong length is refused. `e_value_offs` is not read for such an entry
 and its size is not counted against the inline or block budget.
 `readEAInodeValue` is the callback both call sites pass; it makes every check
-listed above and allocates a fresh slice per call.
+listed above and allocates a fresh slice per call. The links-count check
+was added after checking that valid EA inodes have a non-zero count:
+`mke2fs -d` (e2fsprogs 1.46.5) writes 1, on extent-mapped and block-mapped
+images, and the kernel sets 1 and keeps the sharing count in other fields;
+the `ea_inode` end-to-end row reads kernel-written EA inodes through it.
+The reader that refuses every EA inode, used before `ea_inode` was
+supported, now lives in `ext4/xattr_test.go`, the only place still using it.
 
 `isFastSymlink` agrees with the kernel. Linux (current master)
 `ext4_inode_is_fast_symlink` decides by size alone on an `ea_inode`
@@ -769,9 +779,10 @@ Tests:
   512-byte inodes, 1 KiB blocks with 256-byte inodes and a block-mapped
   filesystem; a shared EA inode (patched in with `debugfs`, since
   `mke2fs -d` never shares one); damaged EA inodes and pointers (out of
-  range, reserved inode, directory, flag missing, size off by one, hole,
-  block outside the filesystem); symlinks owning EA inodes; and block maps
-  pointing past the filesystem. The source tree for the large values is
+  range, reserved inode, directory, flag missing, links count 0, size off
+  by one, hole, block outside the filesystem); symlinks owning EA inodes;
+  and block maps pointing past the filesystem. The source tree for the
+  large values is
   built under `/dev/shm`, because the default temp directory may refuse
   values over about one block; tmpfs takes 64 KiB `user.*` values from
   Linux 6.6. Without that, or without an `ea_inode`-capable `mke2fs`, these
