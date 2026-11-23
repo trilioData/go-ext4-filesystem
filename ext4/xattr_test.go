@@ -492,3 +492,28 @@ func TestReadEAInodeValueRange(t *testing.T) {
 		})
 	}
 }
+
+// s_first_ino below 11 would make reserved inodes (the root directory, the
+// journal, the resize inode) eligible as EA inodes. The kernel refuses to
+// mount such a filesystem; the reader keeps 11 as the floor.
+func TestReadEAInodeValueFirstInoFloor(t *testing.T) {
+	cases := []struct {
+		name     string
+		firstIno uint32
+		inum     uint32
+		want     string
+	}{
+		{"s_first_ino 2, inode 5", 2, 5, "EA inode 5 out of range 11..100"},
+		{"s_first_ino 2, inode 2", 2, 2, "EA inode 2 out of range 11..100"},
+		{"s_first_ino 0, inode 10", 0, 10, "EA inode 10 out of range 11..100"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fsys := &FileSystem{sb: Superblock{RevLevel: 1, FirstIno: c.firstIno, InodeCount: 100}}
+			v, err := fsys.readEAInodeValue(c.inum, 100)
+			if err == nil || err.Error() != c.want {
+				t.Errorf("readEAInodeValue(%d, 100) = %d bytes, %v; want %q", c.inum, len(v), err, c.want)
+			}
+		})
+	}
+}

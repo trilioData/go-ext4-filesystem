@@ -224,8 +224,11 @@ const goodOldFirstIno = 11
 // entries may name the same EA inode, and each value handed to a caller must
 // be its own memory.
 func (ext4 *FileSystem) readEAInodeValue(inum uint32, size int) ([]byte, error) {
+	// s_first_ino is never below 11: the kernel refuses to mount a
+	// filesystem that says otherwise. A smaller value here is damage and
+	// would make the reserved inodes (root, journal, resize) eligible.
 	firstIno := uint32(goodOldFirstIno)
-	if ext4.sb.RevLevel > 0 {
+	if ext4.sb.RevLevel > 0 && ext4.sb.FirstIno > firstIno {
 		firstIno = ext4.sb.FirstIno
 	}
 	if inum < firstIno || inum > ext4.sb.InodeCount {
