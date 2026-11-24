@@ -145,7 +145,8 @@ func (ext4 *FileSystem) readInlineXattrs(raw []byte, out map[string][]byte) erro
 	// starts at its beginning -- so value offsets are measured from the
 	// same point the entries begin.
 	region := raw[magicAt+4:]
-	return parseXattrEntries(region, 0, len(region), ext4.sb.FeatureIncompatEaInode(), out)
+	return parseXattrEntries(region, 0, len(region), ext4.sb.FeatureIncompatEaInode(),
+		ext4.readEAInodeValue, out)
 }
 
 // readBlockXattrs reads attributes stored in a separate block.
@@ -185,7 +186,7 @@ func (ext4 *FileSystem) readBlockXattrs(raw []byte, out map[string][]byte) error
 	// entriesBase is 32 because value offsets are measured from the block
 	// start while entries begin after the header.
 	return parseXattrEntries(block, xattrHeaderSize, int(blockSize)-xattrHeaderSize,
-		ext4.sb.FeatureIncompatEaInode(), out)
+		ext4.sb.FeatureIncompatEaInode(), ext4.readEAInodeValue, out)
 }
 
 // entryLen is EXT2_EXT_ATTR_LEN: the on-disk size of one entry, its name
@@ -194,14 +195,127 @@ func entryLen(nameLen int) int {
 	return (nameLen + 3 + xattrEntrySize) & ^3
 }
 
+// eaValueReader returns the value stored in EA inode inum, which the
+// xattr entry says is size bytes long.
+type eaValueReader func(inum uint32, size int) ([]byte, error)
+
+// goodOldFirstIno is EXT2_GOOD_OLD_FIRST_INO: the first non-reserved inode
+// on a revision 0 filesystem, whose superblock has no s_first_ino.
+const goodOldFirstIno = 11
+
+// readEAInodeValue returns the size bytes stored in EA inode inum.
+//
+// An EA inode is a regular inode flagged EA_INODE_FL whose i_size is the
+// value's length and whose data blocks hold the value. Only an EA inode
+// mapped by extents is read; one without EXTENTS_FL is refused. ext4 writes
+// it with no holes (the kernel's ext4_xattr_inode_read refuses one), so a
+// hole or an unwritten extent is damage and an error. Extents() has already
+// refused any extent outside the filesystem.
+//
+// The returned slice is allocated on every call and never shared: several
+// entries may name the same EA inode, and each value handed to a caller must
+// be its own memory.
+func (ext4 *FileSystem) readEAInodeValue(inum uint32, size int) ([]byte, error) {
+	// s_first_ino is never below 11: the kernel refuses to mount a
+	// filesystem that says otherwise. A smaller value here is damage and
+	// would make the reserved inodes (root, journal, resize) eligible.
+	firstIno := uint32(goodOldFirstIno)
+	if ext4.sb.RevLevel > 0 && ext4.sb.FirstIno > firstIno {
+		firstIno = ext4.sb.FirstIno
+	}
+	if inum < firstIno || inum > ext4.sb.InodeCount {
+		return nil, xerrors.Errorf("EA inode %d out of range %d..%d", inum, firstIno, ext4.sb.InodeCount)
+	}
+	if size <= 0 || size > xattrValueMax {
+		return nil, xerrors.Errorf("EA inode %d: value size %d is invalid", inum, size)
+	}
+
+	inode, err := ext4.getInode(int64(inum))
+	if err != nil {
+		return nil, xerrors.Errorf("EA inode %d: %w", inum, err)
+	}
+	if !inode.IsRegular() {
+		return nil, xerrors.Errorf("EA inode %d is not a regular file (mode %#o)", inum, inode.Mode)
+	}
+	if inode.Flags&EA_INODE_FL == 0 {
+		return nil, xerrors.Errorf("inode %d is not an EA inode (EA_INODE_FL not set, flags %#x)", inum, inode.Flags)
+	}
+	// A freed inode keeps its flags and size until reused: its blocks may
+	// already hold other data. e2fsprogs reports such an EA inode as
+	// corrupted (EXT2_ET_EA_INODE_CORRUPTED) and the kernel refuses it.
+	if inode.LinksCount == 0 {
+		return nil, xerrors.Errorf("EA inode %d is freed (links count 0)", inum)
+	}
+	if !inode.UsesExtents() {
+		return nil, xerrors.Errorf("EA inode %d does not use extents", inum)
+	}
+	if got := inode.GetSize(); got != int64(size) {
+		return nil, xerrors.Errorf("EA inode %d has size %d, entry says %d", inum, got, size)
+	}
+
+	blockSize := ext4.sb.GetBlockSize()
+	nblocks := (int64(size) + blockSize - 1) / blockSize
+	physical, err := ext4.eaInodeBlocks(inode, nblocks)
+	if err != nil {
+		return nil, xerrors.Errorf("EA inode %d: %w", inum, err)
+	}
+
+	value := make([]byte, size)
+	for i, blk := range physical {
+		if blk == 0 {
+			return nil, xerrors.Errorf("EA inode %d: block %d of the value is a hole", inum, i)
+		}
+		chunk := value[int64(i)*blockSize:]
+		if int64(len(chunk)) > blockSize {
+			chunk = chunk[:blockSize]
+		}
+		if n, err := ext4.r.ReadAt(chunk, blk*blockSize); n != len(chunk) {
+			return nil, xerrors.Errorf("EA inode %d: short read of block %d (%d of %d bytes): %w",
+				inum, blk, n, len(chunk), err)
+		}
+	}
+	return value, nil
+}
+
+// eaInodeBlocks returns the physical block of each of the first nblocks
+// logical blocks of an extent-mapped EA inode, 0 where nothing is mapped.
+func (ext4 *FileSystem) eaInodeBlocks(inode *Inode, nblocks int64) ([]int64, error) {
+	physical := make([]int64, nblocks)
+	extents, err := ext4.Extents(inode)
+	if err != nil {
+		return nil, err
+	}
+	for i := range extents {
+		e := &extents[i]
+		start, count := int64(e.Block), int64(e.GetLen())
+		for j := int64(0); j < count && start+j < nblocks; j++ {
+			if physical[start+j] != 0 {
+				return nil, xerrors.Errorf("logical block %d is mapped twice", start+j)
+			}
+			if e.IsUninitialized() {
+				return nil, xerrors.Errorf("logical block %d is in an unwritten extent", start+j)
+			}
+			if e.offset()+j == 0 {
+				return nil, xerrors.Errorf("logical block %d maps to physical block 0", start+j)
+			}
+			physical[start+j] = e.offset() + j
+		}
+	}
+	return physical, nil
+}
+
 // parseXattrEntries walks an entry table and appends what it finds to out.
 //
 // region is the whole storage area that value offsets index into.
 // entriesBase is where the entry table starts within it -- 0 for the inline
 // case, 32 for a block. storageSize is how much of the region the entry table
 // and its values may occupy.
+//
+// A value stored in a separate EA inode (e_value_inum != 0, ea_inode feature)
+// is fetched through readEA. Such a value takes no room in the region: its
+// e_value_offs is not read and its size does not count against storageSize.
 func parseXattrEntries(region []byte, entriesBase, storageSize int,
-	eaInodeFeature bool, out map[string][]byte) error {
+	eaInodeFeature bool, readEA eaValueReader, out map[string][]byte) error {
 
 	if entriesBase+storageSize > len(region) {
 		return xerrors.Errorf("xattr storage size %d overruns region %d",
@@ -226,9 +340,7 @@ func parseXattrEntries(region []byte, entriesBase, storageSize int,
 
 		nameLen := int(e[0])
 		nameIndex := e[1]
-		valueOffs := int(binary.LittleEndian.Uint16(e[2:]))
 		valueInum := binary.LittleEndian.Uint32(e[4:])
-		valueSize := int(binary.LittleEndian.Uint32(e[8:]))
 
 		remain -= xattrEntrySize
 		nameSpace := (nameLen + 3) & ^3
@@ -245,16 +357,38 @@ func parseXattrEntries(region []byte, entriesBase, storageSize int,
 		switch {
 		case valueInum != 0:
 			// The value lives in a separate inode. Only legal with the
-			// ea_inode feature, which the feature gate rejects -- so this
-			// is an error rather than a silently empty value.
+			// ea_inode feature: without it this is an error rather than a
+			// silently empty value.
 			if !eaInodeFeature {
 				return xerrors.Errorf("xattr %q has value inode %d but ea_inode feature is not set",
 					name, valueInum)
 			}
-			return xerrors.Errorf("xattr %q is stored in inode %d: ea_inode is not supported",
-				name, valueInum)
+			// Checked on the raw field, before any conversion to int.
+			rawSize := binary.LittleEndian.Uint32(e[8:])
+			if rawSize == 0 {
+				return xerrors.Errorf("xattr %q in inode %d has value size 0", name, valueInum)
+			}
+			if rawSize > xattrValueMax {
+				return xerrors.Errorf("xattr %q value size %d exceeds maximum %d",
+					name, rawSize, xattrValueMax)
+			}
+			if readEA == nil {
+				return xerrors.Errorf("xattr %q is stored in inode %d but no EA inode reader was given",
+					name, valueInum)
+			}
+			value, err := readEA(valueInum, int(rawSize))
+			if err != nil {
+				return xerrors.Errorf("xattr %q is stored in inode %d: %w", name, valueInum, err)
+			}
+			if len(value) != int(rawSize) {
+				return xerrors.Errorf("xattr %q: inode %d returned %d bytes, want %d",
+					name, valueInum, len(value), rawSize)
+			}
+			out[name] = value
 
 		default:
+			valueOffs := int(binary.LittleEndian.Uint16(e[2:]))
+			valueSize := int(binary.LittleEndian.Uint32(e[8:]))
 			if valueSize > remain {
 				return xerrors.Errorf("xattr %q value size %d exceeds remaining storage %d",
 					name, valueSize, remain)

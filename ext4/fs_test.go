@@ -1454,3 +1454,85 @@ func TestNewFSRejectsZeroGroupSizes(t *testing.T) {
 		})
 	}
 }
+
+// isFastSymlink follows ext4_inode_is_fast_symlink: a symlink is fast when
+// its i_blocks (512-byte units) count no more than the xattr block, if any.
+func TestIsFastSymlink(t *testing.T) {
+	tests := []struct {
+		name         string
+		logBlockSize uint32
+		inode        Inode
+		want         bool
+	}{
+		{"no blocks, no xattr block", 2, Inode{}, true},
+		{"one 4K xattr block", 2, Inode{BlocksLo: 8, FileACLLo: 100}, true},
+		{"one 4K xattr block, high address bits only", 2, Inode{BlocksLo: 8, FileACLHigh: 1}, true},
+		{"one 1K xattr block", 0, Inode{BlocksLo: 2, FileACLLo: 100}, true},
+		{"one data block, no xattr block", 2, Inode{BlocksLo: 8}, false},
+		{"xattr block and a data block", 2, Inode{BlocksLo: 16, FileACLLo: 100}, false},
+		{"1K blocks, a 4K xattr block's worth of sectors", 0, Inode{BlocksLo: 8, FileACLLo: 100}, false},
+		{"blocks counted in the high word", 2, Inode{BlocksHigh: 1, FileACLLo: 100}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fsys := &FileSystem{sb: Superblock{LogBlockSize: tt.logBlockSize, BlockCountLo: testBlockCount}}
+			inode := tt.inode
+			if got := fsys.isFastSymlink(&inode); got != tt.want {
+				t.Errorf("isFastSymlink(blocks=%d/%d, acl=%d/%d) = %v, want %v",
+					inode.BlocksHigh, inode.BlocksLo, inode.FileACLHigh, inode.FileACLLo, got, tt.want)
+			}
+		})
+	}
+}
+
+// On an ea_inode filesystem the blocks of a link's EA inodes are charged to
+// the link's i_blocks (e2fsck requires it), so a short symlink that owns an
+// EA inode counts more than its xattr block. Its target still sits in the
+// inode: a non-zero size below the 60-byte i_block area decides it, as
+// ext2fs_is_fast_symlink in e2fsprogs does.
+func TestIsFastSymlinkWithEAInodeBlocks(t *testing.T) {
+	const xattrBlock = 4096 / 512 // one 4 KiB xattr block, in 512-byte units
+	const eaBlocks = 2 * 4096 / 512
+	symlink := func(size uint32, blocks uint32, acl uint32) Inode {
+		return Inode{Mode: FileTypeSymlink | 0o777, SizeLo: size, BlocksLo: blocks, FileACLLo: acl}
+	}
+	tests := []struct {
+		name    string
+		eaInode bool
+		inode   Inode
+		want    bool
+	}{
+		{"size 20, xattr block and two EA inode blocks", true, symlink(20, xattrBlock+eaBlocks, 100), true},
+		{"size 20, two EA inode blocks, no xattr block", true, symlink(20, eaBlocks, 0), true},
+		{"size 59, xattr block and two EA inode blocks", true, symlink(59, xattrBlock+eaBlocks, 100), true},
+		// 60 bytes and more never fit in i_block: such a target has a block.
+		{"size 60, a data block and an EA inode block", true, symlink(60, 2*xattrBlock, 0), false},
+		{"size 4000, a data block, an xattr block and EA inode blocks", true, symlink(4000, 2*xattrBlock+eaBlocks, 100), false},
+		// An empty target is never a fast link by size: with more than an
+		// xattr block counted it stays slow, as before.
+		{"size 0, xattr block and two EA inode blocks", true, symlink(0, xattrBlock+eaBlocks, 100), false},
+		// The i_blocks test runs first on ea_inode filesystems too: a link
+		// counting at most an xattr block is fast whatever its size, where
+		// the size test alone would call it slow.
+		{"size 0, only an xattr block counted", true, symlink(0, xattrBlock, 100), true},
+		{"size 0, no blocks counted", true, symlink(0, 0, 0), true},
+		{"size 60, only an xattr block counted", true, symlink(60, xattrBlock, 100), true},
+		{"size 4000, no blocks counted", true, symlink(4000, 0, 0), true},
+		// Without ea_inode, i_blocks alone decides, as before.
+		{"size 20, xattr block and two more blocks, no ea_inode", false, symlink(20, xattrBlock+eaBlocks, 100), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sb := Superblock{LogBlockSize: 2, BlockCountLo: testBlockCount}
+			if tt.eaInode {
+				sb.FeatureIncompat |= FEATURE_INCOMPAT_EA_INODE
+			}
+			fsys := &FileSystem{sb: sb}
+			inode := tt.inode
+			if got := fsys.isFastSymlink(&inode); got != tt.want {
+				t.Errorf("isFastSymlink(size=%d, blocks=%d, acl=%d, ea_inode=%v) = %v, want %v",
+					inode.SizeLo, inode.BlocksLo, inode.FileACLLo, tt.eaInode, got, tt.want)
+			}
+		})
+	}
+}

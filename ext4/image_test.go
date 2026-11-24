@@ -25,7 +25,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -33,6 +35,26 @@ import (
 )
 
 // ---------------------------------------------------------------- helpers
+
+// skipUnlessRequired skips with the given reason, or fails with it when
+// EXT4_REQUIRE_TOOLS is set: in CI a missing prerequisite must turn the job
+// red rather than let the test pass by not running.
+func skipUnlessRequired(t *testing.T, format string, args ...interface{}) {
+	t.Helper()
+	if os.Getenv("EXT4_REQUIRE_TOOLS") != "" {
+		t.Fatalf(format+" (EXT4_REQUIRE_TOOLS is set)", args...)
+	}
+	t.Skipf(format, args...)
+}
+
+// kernelRelease returns the running kernel's release, or "unknown".
+func kernelRelease() string {
+	b, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(b))
+}
 
 func requireTools(t *testing.T, tools ...string) {
 	t.Helper()
@@ -844,7 +866,6 @@ func TestImageUnsupportedFeatures(t *testing.T) {
 		{"bigalloc", []string{"-C", "16384"}, "bigalloc"},
 		{"encrypt", nil, "encrypt"},
 		{"casefold", nil, "casefold"},
-		{"ea_inode", nil, "ea_inode"},
 		{"quota", nil, "quota"},
 		{"project,quota", []string{"-I", "256"}, "project"},
 	}
@@ -870,6 +891,24 @@ func TestImageUnsupportedFeatures(t *testing.T) {
 			}
 		})
 	}
+	// ea_inode is read (xattr values in separate inodes), so it opens.
+	t.Run("ea_inode is supported", func(t *testing.T) {
+		img := filepath.Join(t.TempDir(), "fs.img")
+		cmd := exec.Command("mke2fs", "-q", "-F", "-t", "ext4", "-b", "4096",
+			"-O", baseFeatures+",extent,64bit,flex_bg,extra_isize,ea_inode", img, "64M")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			skipUnlessRequired(t, "this mke2fs cannot create ea_inode: %v\n%s", err, out)
+		}
+		f, err := os.Open(img)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		st, _ := f.Stat()
+		if _, err := NewFS(*io.NewSectionReader(f, 0, st.Size()), nil); err != nil {
+			t.Errorf("NewFS: %v", err)
+		}
+	})
 }
 
 // Damaged or foreign input fails with an error, never a panic.
@@ -960,5 +999,552 @@ func TestImageCorruptSymlinkSize(t *testing.T) {
 				t.Errorf("ReadLink(%q) = %v, want a symlink size error", link, err)
 			}
 		}()
+	}
+}
+
+// ---------------------------------------------------------------- EA inodes
+
+// eaInodeConfig returns the named geometry from imageConfigs with ea_inode
+// added: xattr values too large for an xattr block go to separate inodes.
+func eaInodeConfig(t *testing.T, name string) imageConfig {
+	t.Helper()
+	for _, cfg := range imageConfigs {
+		if cfg.name == name {
+			cfg.name += "-ea_inode"
+			cfg.features += ",ea_inode"
+			return cfg
+		}
+	}
+	t.Fatalf("no image config %q", name)
+	return imageConfig{}
+}
+
+// eaInodeConfigNames are the geometries the EA inode tests run on: 4 KiB
+// blocks with 512-byte inodes and 1 KiB blocks with 256-byte inodes.
+var eaInodeConfigNames = []string{"skeleton-4k-i512", "ext4-1k-i256"}
+
+// shmSourceDir returns an empty directory under /dev/shm. The default temp
+// directory's filesystem may refuse xattr values over about 4 KiB; tmpfs
+// takes 64 KiB. Skips when /dev/shm cannot hold a 64 KiB user.* value, or
+// fails when EXT4_REQUIRE_TOOLS is set.
+func shmSourceDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/dev/shm", "ext4-ea-inode-")
+	if err != nil {
+		skipUnlessRequired(t, "no usable /dev/shm for the large-xattr source tree: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	probe := filepath.Join(dir, "probe")
+	writeFile(t, probe, nil, 0o644)
+	if err := syscall.Setxattr(probe, "user.probe", make([]byte, xattrValueMax), 0); err != nil {
+		skipUnlessRequired(t, "/dev/shm does not take a 64 KiB user.* xattr (tmpfs takes user.* "+
+			"xattrs from Linux 6.6; this kernel: %s): %v", kernelRelease(), err)
+	}
+	if err := os.Remove(probe); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// buildEASourceTree creates files whose xattr values are large enough to be
+// stored in EA inodes. Returns the tree root.
+func buildEASourceTree(t *testing.T) string {
+	t.Helper()
+	requireTools(t, "mke2fs", "debugfs", "e2fsck")
+	src := shmSourceDir(t)
+	rng := rand.New(rand.NewSource(2))
+	setx := func(p, name string, v []byte) {
+		if err := syscall.Setxattr(filepath.Join(src, p), name, v, 0); err != nil {
+			t.Fatalf("setxattr %s %s (%d bytes): %v", p, name, len(v), err)
+		}
+	}
+	file := func(p string) { writeFile(t, filepath.Join(src, p), []byte(p), 0o644) }
+
+	// One value each, either side of what fits in a 4 KiB xattr block.
+	for _, n := range []int{4040, 4041, 8192, 65536} {
+		p := fmt.Sprintf("v%05d", n)
+		file(p)
+		setx(p, "user.v", randBytes(rng, n))
+	}
+	// Two maximum-size values on one inode.
+	file("two-max")
+	setx("two-max", "user.a", randBytes(rng, 65536))
+	setx("two-max", "user.b", randBytes(rng, 65536))
+	// Inline, xattr block and EA inode on one inode.
+	file("mixed")
+	setx("mixed", "user.inline", randBytes(rng, 10))
+	setx("mixed", "user.block", randBytes(rng, 3000))
+	setx("mixed", "user.eainode", randBytes(rng, 16384))
+	// An ACL beside a large value, when the source takes ACLs.
+	file("acl")
+	access := posixACL(
+		[3]uint32{aclUserObj, 6, undef}, [3]uint32{aclUser, 6, 1234},
+		[3]uint32{aclGroupObj, 4, undef}, [3]uint32{aclMask, 6, undef},
+		[3]uint32{aclOther, 4, undef})
+	if err := syscall.Setxattr(filepath.Join(src, "acl"), XattrPosixACLAccess, access, 0); err != nil {
+		t.Logf("source does not take ACLs (%v); acl file has only user.v", err)
+	}
+	setx("acl", "user.v", randBytes(rng, 8192))
+	// A directory with a large value.
+	if err := os.Mkdir(filepath.Join(src, "dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setx("dir", "user.v", randBytes(rng, 8192))
+	// Two files and two names on one file with different values of the same
+	// size, for the shared EA inode test to point at one another.
+	file("shared-a")
+	setx("shared-a", "user.v", randBytes(rng, 8192))
+	file("shared-b")
+	setx("shared-b", "user.v", randBytes(rng, 8192))
+	return src
+}
+
+var debugfsStatHead = regexp.MustCompile(`^Inode: (\d+)\s+Type: (\S+).*Flags: 0x([0-9a-f]+)`)
+var debugfsStatSize = regexp.MustCompile(`\bSize: (\d+)`)
+
+// eaInodeSizes lists, through debugfs, the size of every regular inode that
+// carries EXT4_EA_INODE_FL among the first n inodes.
+func eaInodeSizes(t *testing.T, img string, n int) map[int]int64 {
+	t.Helper()
+	var cmds []string
+	for i := 1; i <= n; i++ {
+		cmds = append(cmds, fmt.Sprintf("stat <%d>", i))
+	}
+	out := run(t, strings.Join(cmds, "\n")+"\n", "debugfs", "-f", "-", img)
+	sizes := map[int]int64{}
+	lines := strings.Split(out, "\n")
+	for i, line := range lines {
+		m := debugfsStatHead.FindStringSubmatch(line)
+		if m == nil || m[2] != "regular" || i+2 >= len(lines) {
+			continue
+		}
+		flags, _ := strconv.ParseUint(m[3], 16, 32)
+		if flags&0x200000 == 0 {
+			continue
+		}
+		// "Generation: ..." then "User: ... Size: N".
+		s := debugfsStatSize.FindStringSubmatch(lines[i+2])
+		if s == nil {
+			t.Fatalf("no size after %q: %q", line, lines[i+2])
+		}
+		ino, _ := strconv.Atoi(m[1])
+		sizes[ino], _ = strconv.ParseInt(s[1], 10, 64)
+	}
+	return sizes
+}
+
+// buildEAImage builds an ea_inode image from src and checks with debugfs
+// that the 4041-byte value -- one byte more than fits beside its entry in a
+// 4 KiB xattr block -- really sits in an EA inode. Skips, naming the reason,
+// when this mke2fs does not put large values in EA inodes.
+func buildEAImage(t *testing.T, cfg imageConfig, src string) string {
+	t.Helper()
+	img := buildImage(t, cfg, src, nil)
+	sizes := eaInodeSizes(t, img, 128)
+	var found []int64
+	has4041 := false
+	for _, s := range sizes {
+		found = append(found, s)
+		has4041 = has4041 || s == 4041
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i] < found[j] })
+	t.Logf("%s: EA inode sizes %v", cfg.name, found)
+	if !has4041 {
+		if os.Getenv("EXT4_REQUIRE_TOOLS") != "" {
+			t.Fatalf("mke2fs -d put no 4041-byte value in an EA inode (EA inodes: %v)", found)
+		}
+		t.Skipf("this mke2fs -d does not store large values in EA inodes (EA inodes: %v)", found)
+	}
+	return img
+}
+
+// Values stored in EA inodes read back as the source holds them, beside
+// inline and block values, on files and directories, for every geometry.
+func TestImageEAInodeXattrs(t *testing.T) {
+	for _, name := range eaInodeConfigNames {
+		cfg := eaInodeConfig(t, name)
+		t.Run(cfg.name, func(t *testing.T) {
+			src := buildEASourceTree(t)
+			img := buildEAImage(t, cfg, src)
+			fsys := openImage(t, img, 0)
+			entries, err := os.ReadDir(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range entries {
+				rel := e.Name()
+				t.Run(rel, func(t *testing.T) {
+					want := sourceXattrs(t, filepath.Join(src, rel))
+					got, err := fsys.ListXattrs(lookupInfo(t, fsys, rel).InodeNumber())
+					if err != nil {
+						t.Fatalf("ListXattrs: %v", err)
+					}
+					compareXattrs(t, got, want)
+				})
+			}
+		})
+	}
+}
+
+// eaEntry locates an xattr entry on the inode at path in an image, looking
+// first in the inode body and then in its xattr block. Returns the entry's
+// byte offset in the image and its e_value_inum. Found through debugfs imap,
+// so it works on an image this package cannot open.
+func eaEntry(t *testing.T, img string, data []byte, cfg imageConfig, path string, index byte, name string) (int64, uint32) {
+	t.Helper()
+	out := run(t, "", "debugfs", "-R", "imap "+path, img)
+	m := regexp.MustCompile(`located at block (\d+), offset 0x([0-9a-f]+)`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("debugfs imap %s: %q", path, out)
+	}
+	blk, _ := strconv.ParseInt(m[1], 10, 64)
+	off, _ := strconv.ParseInt(m[2], 16, 64)
+	inodeAt := blk*int64(cfg.blockSize) + off
+	raw := data[inodeAt : inodeAt+int64(cfg.inodeSize)]
+
+	walk := func(pos, end int64) (int64, uint32, bool) {
+		for pos+xattrEntrySize <= end && binary.LittleEndian.Uint32(data[pos:]) != 0 {
+			nl := int64(data[pos])
+			if data[pos+1] == index && string(data[pos+xattrEntrySize:pos+xattrEntrySize+nl]) == name {
+				return pos, binary.LittleEndian.Uint32(data[pos+4:]), true
+			}
+			pos += int64(entryLen(int(nl)))
+		}
+		return 0, 0, false
+	}
+	if cfg.inodeSize > goodOldInodeSize {
+		magicAt := int64(goodOldInodeSize) + int64(binary.LittleEndian.Uint16(raw[extraIsizeOffset:]))
+		if binary.LittleEndian.Uint32(raw[magicAt:]) == xattrMagic {
+			if pos, inum, ok := walk(inodeAt+magicAt+4, inodeAt+int64(cfg.inodeSize)); ok {
+				return pos, inum
+			}
+		}
+	}
+	if acl := int64(binary.LittleEndian.Uint32(raw[104:])) | int64(binary.LittleEndian.Uint16(raw[118:]))<<32; acl != 0 {
+		base := acl * int64(cfg.blockSize)
+		if pos, inum, ok := walk(base+xattrHeaderSize, base+int64(cfg.blockSize)); ok {
+			return pos, inum
+		}
+	}
+	t.Fatalf("%s: no xattr entry %d/%q", path, index, name)
+	return 0, 0
+}
+
+// writePatched writes data to a new image file and returns its path.
+func writePatched(t *testing.T, data []byte) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "patched.img")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// debugfsPatch applies debugfs write commands to a copy of img.
+func debugfsPatch(t *testing.T, img string, cmds ...string) string {
+	t.Helper()
+	data, err := os.ReadFile(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := writePatched(t, data)
+	out := run(t, strings.Join(cmds, "\n")+"\n", "debugfs", "-w", "-f", "-", p)
+	for _, line := range strings.Split(out, "\n") {
+		if line != "" && !strings.HasPrefix(line, "debugfs") {
+			t.Fatalf("debugfs reported: %q\nfull output:\n%s", line, out)
+		}
+	}
+	return p
+}
+
+// Several entries may point at one EA inode (the kernel shares EA inodes
+// between equal values). mke2fs -d never shares one, so the image is
+// patched: user.b of two-max is pointed at the EA inode of user.a, and
+// user.v of shared-b at the EA inode of shared-a. Every value read must be
+// its own memory: changing one returned value changes no other.
+func TestImageEAInodeShared(t *testing.T) {
+	for _, name := range eaInodeConfigNames {
+		cfg := eaInodeConfig(t, name)
+		t.Run(cfg.name, func(t *testing.T) {
+			src := buildEASourceTree(t)
+			img := buildEAImage(t, cfg, src)
+			data, err := os.ReadFile(img)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, aInum := eaEntry(t, img, data, cfg, "/two-max", 1, "a")
+			bAt, bInum := eaEntry(t, img, data, cfg, "/two-max", 1, "b")
+			_, saInum := eaEntry(t, img, data, cfg, "/shared-a", 1, "v")
+			sbAt, sbInum := eaEntry(t, img, data, cfg, "/shared-b", 1, "v")
+			if aInum == 0 || saInum == 0 || bInum == 0 || sbInum == 0 {
+				t.Fatalf("values not in EA inodes: a=%d b=%d shared-a=%d shared-b=%d", aInum, bInum, saInum, sbInum)
+			}
+			binary.LittleEndian.PutUint32(data[bAt+4:], aInum)
+			binary.LittleEndian.PutUint32(data[sbAt+4:], saInum)
+			fsys := openImage(t, writePatched(t, data), 0)
+
+			wantA := sourceXattrs(t, filepath.Join(src, "two-max"))["user.a"]
+			wantSA := sourceXattrs(t, filepath.Join(src, "shared-a"))["user.v"]
+
+			// Two names on one inode, one EA inode.
+			got, err := fsys.ListXattrs(lookupInfo(t, fsys, "two-max").InodeNumber())
+			if err != nil {
+				t.Fatalf("ListXattrs(two-max): %v", err)
+			}
+			compareXattrs(t, got, map[string][]byte{"user.a": wantA, "user.b": wantA})
+			got["user.a"][0] ^= 0xff
+			if !bytes.Equal(got["user.b"], wantA) {
+				t.Error("changing user.a changed user.b: the values share memory")
+			}
+
+			// Two files, one EA inode.
+			sa, err := fsys.ListXattrs(lookupInfo(t, fsys, "shared-a").InodeNumber())
+			if err != nil {
+				t.Fatalf("ListXattrs(shared-a): %v", err)
+			}
+			compareXattrs(t, sa, map[string][]byte{"user.v": wantSA})
+			sa["user.v"][0] ^= 0xff
+			sb, err := fsys.ListXattrs(lookupInfo(t, fsys, "shared-b").InodeNumber())
+			if err != nil {
+				t.Fatalf("ListXattrs(shared-b): %v", err)
+			}
+			compareXattrs(t, sb, map[string][]byte{"user.v": wantSA})
+			sa2, err := fsys.ListXattrs(lookupInfo(t, fsys, "shared-a").InodeNumber())
+			if err != nil {
+				t.Fatalf("ListXattrs(shared-a) again: %v", err)
+			}
+			compareXattrs(t, sa2, map[string][]byte{"user.v": wantSA})
+		})
+	}
+}
+
+// A damaged pointer to an EA inode, or a damaged EA inode, is an error
+// naming the reason, never a panic and never bytes from elsewhere.
+func TestImageEAInodeCorrupt(t *testing.T) {
+	for _, name := range eaInodeConfigNames {
+		cfg := eaInodeConfig(t, name)
+		t.Run(cfg.name, func(t *testing.T) {
+			src := buildEASourceTree(t)
+			img := buildEAImage(t, cfg, src)
+			data, err := os.ReadFile(img)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entryAt, ea := eaEntry(t, img, data, cfg, "/v08192", 1, "v")
+			if ea == 0 {
+				t.Fatal("v08192 value is not in an EA inode")
+			}
+			plain := inodeNumber(t, img, "/v04040")
+			dir := inodeNumber(t, img, "/dir")
+			var sb Superblock
+			if sb, err = parseSuperBlock(bytes.NewReader(data)); err != nil {
+				t.Fatal(err)
+			}
+
+			pointAt := func(inum uint32) string {
+				b := append([]byte(nil), data...)
+				binary.LittleEndian.PutUint32(b[entryAt+4:], inum)
+				return writePatched(t, b)
+			}
+			// i_block[0] is the extent header's magic and entry count: no
+			// entries leaves the value a hole. i_block[5] is the first
+			// extent's physical start.
+			hole := fmt.Sprintf("sif <%d> block[0] 0xF30A", ea)
+			outside := fmt.Sprintf("sif <%d> block[5] 0x7fffffff", ea)
+			cases := []struct {
+				name, img, want string
+			}{
+				{"past the inode count", pointAt(sb.InodeCount + 1), "out of range"},
+				{"inode 2", pointAt(2), "out of range"},
+				{"last reserved inode", pointAt(sb.FirstIno - 1), "out of range"},
+				{"directory", pointAt(uint32(dir)), "not a regular file"},
+				{"regular file without EA_INODE_FL", pointAt(uint32(plain)), "EA_INODE_FL"},
+				{"size one byte short", debugfsPatch(t, img, fmt.Sprintf("sif <%d> size 8191", ea)), "size 8191"},
+				// A freed EA inode: e2fsprogs reports EXT2_ET_EA_INODE_CORRUPTED.
+				{"links count 0", debugfsPatch(t, img, fmt.Sprintf("sif <%d> links_count 0", ea)), "links count 0"},
+				{"first extent removed (hole)", debugfsPatch(t, img, hole), "hole"},
+				{"block outside the filesystem", debugfsPatch(t, img, outside), "outside the filesystem"},
+			}
+			for _, c := range cases {
+				t.Run(c.name, func(t *testing.T) {
+					defer func() {
+						if r := recover(); r != nil {
+							t.Fatalf("panic: %v", r)
+						}
+					}()
+					fsys := openImage(t, c.img, 0)
+					got, err := fsys.ListXattrs(lookupInfo(t, fsys, "v08192").InodeNumber())
+					if err == nil {
+						t.Fatalf("ListXattrs succeeded with %d values", len(got))
+					}
+					if !strings.Contains(err.Error(), c.want) {
+						t.Errorf("error %q does not mention %q", err, c.want)
+					}
+					t.Logf("%v", err)
+				})
+			}
+		})
+	}
+}
+
+// An EA inode that does not use extents is refused, naming the inode. The
+// images this reader serves are ext4 with extents; a block-mapped EA inode
+// is not read. mke2fs -d on a filesystem without the extent feature writes
+// every EA inode with the classic block map, so every value stored in an EA
+// inode there -- every file of the source tree on 1 KiB blocks -- must fail.
+func TestImageEAInodeWithoutExtents(t *testing.T) {
+	cfg := eaInodeConfig(t, "ext3-1k-blockmap")
+	src := buildEASourceTree(t)
+	img := buildEAImage(t, cfg, src)
+	fsys := openImage(t, img, 0)
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := regexp.MustCompile(`EA inode \d+ does not use extents`)
+	for _, e := range entries {
+		rel := e.Name()
+		t.Run(rel, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			got, err := fsys.ListXattrs(lookupInfo(t, fsys, rel).InodeNumber())
+			if err == nil {
+				t.Fatalf("ListXattrs succeeded with %d values", len(got))
+			}
+			if !refused.MatchString(err.Error()) {
+				t.Errorf("error %q does not say the EA inode does not use extents", err)
+			}
+		})
+	}
+}
+
+// inodeNumber returns the inode number of path, through debugfs.
+func inodeNumber(t *testing.T, img, path string) int {
+	t.Helper()
+	out := run(t, "", "debugfs", "-R", "stat "+path, img)
+	var m []string
+	if i := strings.Index(out, "Inode:"); i >= 0 {
+		m = debugfsStatHead.FindStringSubmatch(out[i:])
+	}
+	if m == nil {
+		t.Fatalf("debugfs stat %s: %q", path, out)
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
+// A short symlink that owns an EA inode is still a fast symlink. The blocks
+// of a link's EA inodes are charged to its i_blocks (e2fsck requires it, the
+// kernel does it, and so does the backup side), so i_blocks counts more than
+// an xattr block although the target sits in the inode. debugfs ea_set gives
+// the links their values (an unprivileged user cannot set trusted.* in the
+// source tree, and user.* is not allowed on a symlink).
+//
+// short-ea-block (xattr block and EA inode) and long-ea are charged by
+// buildImage's e2fsck pass and come out clean. short-ea (EA inode, no xattr
+// block) is given its value and its charge after that pass: e2fsck 1.46.5
+// asks for the charge but, once it is made, takes the link for a slow one
+// (ext2fs_inode_has_valid_blocks2 trusts i_blocks when there is no xattr
+// block) and reports the target bytes as illegal blocks.
+func TestImageSymlinkWithEAInode(t *testing.T) {
+	for _, name := range eaInodeConfigNames {
+		cfg := eaInodeConfig(t, name)
+		t.Run(cfg.name, func(t *testing.T) {
+			requireTools(t, "mke2fs", "debugfs", "e2fsck")
+			rng := rand.New(rand.NewSource(3))
+			src, vals := t.TempDir(), t.TempDir()
+			writeFile(t, filepath.Join(src, "target"), []byte("link target\n"), 0o644)
+			longTarget := strings.Repeat("./", 40) + "target" // 86 bytes: a slow link
+			for link, target := range map[string]string{
+				"short-ea":       "target",
+				"short-ea-block": "target",
+				"long-ea":        longTarget,
+			} {
+				if err := os.Symlink(target, filepath.Join(src, link)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A value as large as a block does not fit in an xattr block
+			// and goes to an EA inode. ea_set -f in e2fsprogs 1.46.5 stores
+			// the first block of the file.
+			big := randBytes(rng, 4096)
+			medium := randBytes(rng, 300)
+			writeFile(t, filepath.Join(vals, "big"), big, 0o644)
+			writeFile(t, filepath.Join(vals, "medium"), medium, 0o644)
+			cmds := []string{
+				"ea_set -f " + filepath.Join(vals, "big") + " /short-ea-block trusted.big",
+				"ea_set -f " + filepath.Join(vals, "big") + " /long-ea trusted.big",
+			}
+			// Enough medium values to spill out of the inode into an
+			// xattr block.
+			for i := 1; i <= 4; i++ {
+				cmds = append(cmds, fmt.Sprintf("ea_set -f %s /short-ea-block trusted.m%d",
+					filepath.Join(vals, "medium"), i))
+			}
+			img := buildImage(t, cfg, src, cmds)
+			// The stored value is one block (see above): one block charged.
+			img = debugfsPatch(t, img,
+				"ea_set -f "+filepath.Join(vals, "big")+" /short-ea trusted.big",
+				fmt.Sprintf("sif /short-ea blocks %d", cfg.blockSize/512))
+			fsys := openImage(t, img, 0)
+
+			for link, target := range map[string]string{
+				"short-ea":       "target",
+				"short-ea-block": "target",
+				"long-ea":        longTarget,
+			} {
+				t.Run(link, func(t *testing.T) {
+					fi := lookupInfo(t, fsys, link)
+					inode := fi.inode
+					blocks := uint64(inode.BlocksHigh)<<32 | uint64(inode.BlocksLo)
+					var xattrBlock uint64
+					if inode.FileACLLo != 0 || inode.FileACLHigh != 0 {
+						xattrBlock = uint64(cfg.blockSize / 512)
+					}
+					t.Logf("size %d, i_blocks %d, xattr block %v", inode.GetSize(), blocks, xattrBlock != 0)
+					// The case under test: i_blocks alone would call a
+					// short link slow.
+					if blocks <= xattrBlock {
+						t.Fatalf("i_blocks %d does not exceed the xattr block (%d): no EA inode blocks charged",
+							blocks, xattrBlock)
+					}
+					if wantBlock := link == "short-ea-block"; (xattrBlock != 0) != wantBlock {
+						t.Fatalf("%s: xattr block present = %v, want %v", link, xattrBlock != 0, wantBlock)
+					}
+
+					got, err := fsys.ReadLink(link)
+					if err != nil || got != target {
+						t.Fatalf("ReadLink = %q, %v; want %q", got, err, target)
+					}
+					f, err := fsys.Open(link)
+					if err != nil {
+						t.Fatalf("Open through the link: %v", err)
+					}
+					defer f.Close()
+					if b, err := io.ReadAll(f); err != nil || string(b) != "link target\n" {
+						t.Errorf("read through the link = %q, %v", b, err)
+					}
+
+					xattrs, err := fsys.ListXattrs(fi.InodeNumber())
+					if err != nil {
+						t.Fatalf("ListXattrs: %v", err)
+					}
+					v := xattrs["trusted.big"]
+					if len(v) != cfg.blockSize || !bytes.Equal(v, big[:len(v)]) {
+						t.Errorf("trusted.big: %d bytes, want the first %d bytes of the value", len(v), cfg.blockSize)
+					}
+					if link == "short-ea-block" {
+						for i := 1; i <= 4; i++ {
+							if m := xattrs[fmt.Sprintf("trusted.m%d", i)]; !bytes.Equal(m, medium) {
+								t.Errorf("trusted.m%d: %d bytes, want the 300-byte value", i, len(m))
+							}
+						}
+					}
+				})
+			}
+		})
 	}
 }

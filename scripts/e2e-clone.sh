@@ -19,7 +19,11 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 big=${1:-}
 work=$(mktemp -d /tmp/ext4-e2e.XXXXXX)
 img=$work/disk.img src=$work/src clone=$work/clone
-cleanup() { umount "$src" 2>/dev/null || true; rm -rf "$work"; }
+cleanup() {
+  umount "$src" 2>/dev/null || true
+  umount "$work/clonefs" 2>/dev/null || true
+  rm -rf "$work"
+}
 trap cleanup EXIT
 
 size=512M; [ -n "$big" ] && size=1G
@@ -27,13 +31,31 @@ truncate -s "$size" "$img"
 # shellcheck disable=SC2086
 mkfs.ext4 -F -q ${MKFS_OPTS:-} "$img"
 dumpe2fs -h "$img" 2>/dev/null | grep -E "features|Block size|Inode size"
+# Detected once, from the image: the populate script is told rather than
+# left to detect it, so a failed detection cannot skip the large values.
+features=$(dumpe2fs -h "$img" 2>/dev/null | grep '^Filesystem features:')
+ea_inode=0
+case " $features " in *" ea_inode "*) ea_inode=1 ;; esac
 
 mkdir -p "$src"
 mount -o loop "$img" "$src"
-bash "$repo/scripts/e2e-populate.sh" "$src" "$big"
+EXT4_E2E_EA_INODE=$ea_inode bash "$repo/scripts/e2e-populate.sh" "$src" "$big"
 umount "$src"
 e2fsck -fn "$img"
 mount -o loop,ro "$img" "$src"
+
+# With ea_inode the source holds xattr values up to 64 KiB, which an ext4
+# without the feature refuses (ENOSPC), and /tmp may be one. Clone onto an
+# ext4 formatted like the source then, into a subdirectory so its own
+# lost+found stays out of the comparison.
+if [ "$ea_inode" = 1 ]; then
+  truncate -s "$size" "$work/clone.img"
+  # shellcheck disable=SC2086
+  mkfs.ext4 -F -q ${MKFS_OPTS:-} "$work/clone.img"
+  mkdir -p "$work/clonefs"
+  mount -o loop "$work/clone.img" "$work/clonefs"
+  clone=$work/clonefs/clone
+fi
 
 cd "$repo"
 EXT4_E2E_IMAGE=$img EXT4_E2E_SOURCE=$src EXT4_E2E_CLONE=$clone \

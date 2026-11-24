@@ -62,11 +62,15 @@ const (
 	// in the superblock rather than derived from the UUID). This reader does
 	// not verify checksums, so the layout it reads is unchanged. mkfs.ext4
 	// enables it by default from e2fsprogs 1.47.1.
+	//
+	// EA_INODE stores an xattr value too large for the xattr block in a
+	// separate inode; ListXattrs reads it from there (readEAInodeValue).
 	supportedIncompat = FEATURE_INCOMPAT_FILETYPE |
 		FEATURE_INCOMPAT_EXTENTS |
 		FEATURE_INCOMPAT_64BIT |
 		FEATURE_INCOMPAT_FLEX_BG |
-		FEATURE_INCOMPAT_CSUM_SEED
+		FEATURE_INCOMPAT_CSUM_SEED |
+		FEATURE_INCOMPAT_EA_INODE
 )
 
 type featureName struct {
@@ -165,7 +169,6 @@ func (sb *Superblock) UnsupportedCompatFeatures() uint32 {
 //   - bigalloc: allocation is in clusters, not blocks.
 //   - inline_data: small file contents live in the inode body.
 //   - encrypt / casefold / verity: content or names are not what they appear.
-//   - ea_inode: extended attribute values live in separate inodes.
 //   - meta_bg: group descriptors are laid out differently.
 //
 // has_journal itself is accepted. It is a COMPAT feature and a clean journal

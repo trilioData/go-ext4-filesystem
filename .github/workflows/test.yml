@@ -65,6 +65,12 @@ jobs:
             os: ubuntu-24.04
             mkfs: "-I 512 -O ^has_journal,^orphan_file"
             big: big
+          # Large xattr values in EA inodes; the clone goes onto an ext4
+          # formatted the same way (scripts/e2e-clone.sh).
+          - name: skeleton layout with ea_inode
+            os: ubuntu-24.04
+            mkfs: "-I 512 -O ^has_journal,^orphan_file,ea_inode"
+            big: big
           - name: 1 KiB blocks, 128-byte inodes
             os: ubuntu-24.04
             mkfs: "-b 1024 -I 128"

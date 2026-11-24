@@ -8,6 +8,7 @@ const (
 
 	INDEX_FL                        = 0x00001000
 	EXTENTS_FL                      = 0x00080000
+	EA_INODE_FL                     = 0x00200000 // inode holds one xattr value
 	FEATURE_COMPAT_DIR_PREALLOC     = 0x0001
 	FEATURE_COMPAT_IMAGIC_INODES    = 0x0002
 	FEATURE_COMPAT_HAS_JOURNAL      = 0x0004
